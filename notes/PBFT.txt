@@ -1,0 +1,266 @@
+Practical Byzantine Fault Tolerance
+===================================
+
+Suppose you have N replicas, f of which might crash (non-Byzantine failure)
+What quorum size Q do you need to guarantee liveness and safety?
+  * Liveness: (or pseudo-liveness, i.e., avoiding stuck states)
+      There must be a non-failed quorum (*quorum availability*)
+      Hence: Q <= N - f
+  * Safety:  Any two quorums must intersect at one or more nodes
+      Otherwise, two quorums could independently accept operations, diverge
+      This property is often known as the *quorum intersection* property
+      You want to make sure that there's at least an overlap size of 1 between
+      two quorum regions Q, as shown below:
+
+                                     Q
+                                XXXXXXXXXX
+                                X        X
+                                +-----+    +-+
+                                |1|2|3|....|N|
+                                +-----+    +-+
+                                X     X
+                                XXXXXXX
+                                  f
+                                    X        X
+                                    XXXXXXXXXX
+                                        Q
+
+      Hence: 2Q - N > 0
+  So: N < 2Q <= 2(N - f)
+  Note highest possible f: N < 2N-2f; f < N/2
+  And if N = 2f + 1, smallest Q is 2Q > 2f + 1; Q = f + 1
+
+Now say we throw in Byzantine failures...
+  Say you have N nodes, f of which might experience Byzantine failure.
+  First, how can Byzantine failures be worse than non-Byzantine?
+    Byzantine nodes can make contradictory statements to different nodes
+    E.g., violate voting rules by voting twice for different outcomes
+  Consequences
+    Risks driving non-failed nodes into divergent states (no safety)
+    Risks driving non-failed nodes into "stuck states"
+      E.g., cause split vote on seemingly irrefutable statement
+      VR example: nodes can't agree on event associated with last viewstamp
+
+What quorum size Q do we need in Byzantine setting?
+  * f is # of Byzantine failures
+  * Liveness: Q <= N - f
+      As in non-Byzantine case, failed nodes might not reply
+      Second threat to liveness: beyond safety, a bad node can also
+      create a stuck state.
+  * Safety: Quorum intersection must contain one *non-faulty* node
+      Idea: out of f+1 nodes, at most f can be faulty (can't get away with just
+      0< faulty nodes like in non-Byzantine failure!)
+      Hence:  2Q - N > f    (since f could be malicious)
+  So: N + f < 2Q <= 2(N - f)
+  Highest f:  N+f < 2N-2f; 3f < N; f < N/3
+  And if N = 3f + 1, the smallest Q is:
+    N + f < 2Q; 3f + 1 + f < 2Q;  2f + 1/2 < Q; Q_min = 2f + 1
+
+So how does PBFT protocol work?
+  Number replica cohorts 1, 2, 3, ..., 3f+1
+  Number requests with consecutive sequence numbers (not viewstamps)
+  System goes through a series of views
+    In view v, replica number v mod (3f+1) is designated the primary
+    Primary is responsible for selecting the order of operations
+      Assigns an increasing sequence number to each operation
+  In normal-case operation, use two-round protocol for request r:
+    Round 1 (pre-prepare, prepare) goal:
+      Ensure at least f+1 honest replicas agree that
+        If request r executes in view v, will execute with sequence no. n
+    Round 2 (commit) goal:
+      Ensure at least f+1 honest replicas agree that
+        Request r has executed in view v with sequence no. n
+
+Protocol for normal-case operation
+  Let c be client
+      r_i be replica i, or p primary, b_i backup i
+      R set of all replicas
+
+      _Kc is client signature, so you can verify REQUEST integrity
+      t is timestamp to prevent replay attack
+      o is operation
+      m is the entire first msg sent from c -> p below
+      n is sequence number
+
+    c -> p:  m = <REQUEST, o, t, c>_Kc
+    p -> R:  <PRE-PREPARE, v, n, d>_Kp, m     (note d = H(m))
+  b_i -> R:  <PREPARE, v, n, d, i>_K{r_i}
+  [Note all messages signed, so henceforth < > means implicit signature.]
+
+  replica r_i now waits for PRE-PREPARE + 2f matching PREPARE messages
+     puts these messages in its log
+     then we say prepared(m, v, n, i) is TRUE
+
+  Note:  If prepared(m, v, n, i) is TRUE for honest replica r_i
+         then prepared(m', v, n, j) where m' != m FALSE for any honest r_j
+     Why?  Because each of r_i, r_j has 2f+1 signed [pre-]prepare messages
+       Given 3f+1 replicas, messages at r_i and r_j must share f+1 sources
+       But at most f nodes are malicious, so one of those won't double vote
+       So the two sets of 2f+1 agreeing messages must agree with one another
+     Means no other operation can execute with view v sequence number n
+
+   Votes in PREPARE messages can be sent out tentatively across a short
+   time period
+     BUT only clients will know of COMMIT status, not necessarily entire
+     cohort.
+     Cohorts learn through the extra round of COMMITS. That's why the third
+     round is necessary.
+
+  Are we done?  Just reply to client?  No
+    Just because some other m' won't execute at (v,n) doesn't mean m will
+      Suppose r_i is partitioned right after prepared(m, v, n, i)
+      Suppose no other replica received r_i's prepare message
+      Suppose f replicas are slow and never even received the PRE-PREPARE
+      No other honest replica will know the request prepared!
+      If p fails, m' != m might get executed at (v+1,n)
+    Would be bad if r_i had said m committed in slot n when it didn't
+      f bad nodes could "join" r_i, falsely convincing client m committed at n
+      f nodes could crash, won't have 2f+1 to agree on sequence number n
+
+  So we say operation doesn't execute until
+    prepared(m, v, n, i) is TRUE for f+1 non-faulty replicas r_i
+    We say committed(m, v, n) is TRUE when this property holds (b_i -> R)
+
+  So how does a replica *know* committed(m, v, n) holds?
+    Add one more message:
+
+  r_i -> R: <COMMIT, v, n, d, i>    (sent only after prepared(m,v,n,i))
+
+  replica r_i waits for 2f+1 identical COMMIT messages (including its own)
+    committed-local(m, v, n, i) is TRUE when:
+      prepared(m, v, n, i) is TRUE, and
+      r_i has 2f+1 matching commits in its log
+
+  Note:  If committed-local(m, v, n, i) is TRUE for any non-faulty r_i
+    Then means committed(m, v, n) is TRUE.
+    r_i knows when committed-local is TRUE
+    So committed-local is a replica's way of knowing that committed is TRUE
+
+r_i replies to client when committed-local(m, v, n, i) is TRUE
+  Client waits for f+1 matching replies, then returns to client
+  Why f+1 and not 2f+1?
+    Because of f+1, at least one replica r_i is non-faulty
+    So client knows committed-local(m, v, n, i) (even if it doesn't know i)
+    Which in turn implies committed(m, v, n)
+
+Garbage collecting the message log
+  make periodic checkpoints
+    Broadcast <CHECKPOINT, n, d, i>, where d = digest of state
+    A stable checkpoint has state + proof comprising 2f+1 signed CHECKPOINTs
+  restrict sequence numbers are between h and H
+    h = sequence number of last stable checkpoint
+    H = h + k   (e.g., k might be 2 * checkpoint interval of 100)
+    Why?  Don't want bad primary exhausting sequence number space
+  delete all messages below sequence number of stable checkpoint
+
+View changes
+  When client doesn't get an answer, broadcasts message to all replicas
+  If a backup notices primary is slow/unresponsive:
+  - broadcast <VIEW-CHANGE v+1, n, C, P, i>
+    v+1 is next view you want to change to
+    n is sequence number of last stable checkpoint
+    C is 2f+1 signed checkpoint messages for last stable checkpoint
+    P = {P_m} where each P_m is signed PRE-PREPARE + 2f signed PREPARES
+      i.e., P is set of all PREPAREd messages since checkpoint
+            + proof that the messages really are prepared
+    C and P are proof of stable checkpoint.
+
+  When primary of view v+1 sees 2f signed VIEW-CHANGE messages from others, then
+  - New primary broadcasts <NEW-VIEW, v+1, V, O>
+      V is set of at least 2f+1 VIEW-CHANGE messages (including by new primary)
+      O is a set of pre-prepare messages, for operations that are:
+        - after last stable checkpoint (assume everyone has executed up to
+        sequence number n)
+        - appear in the set P of one of the VIEW-CHANGE messages
+      O also contains dummy messages to fill in sequence number gaps
+
+  Replicas may optain any missing state from each other
+    (e.g., stable checkpoint data, or missing operation, since
+     reissued pre-prepare messages only contain digest of request)
+
+What happens if primary creates incorrect O in NEW-VIEW message?
+  E.g., might send null requests for operations that prepared
+  Other replicas can compute O from V, and can reject NEW-VIEW message
+What happens if primary sends different V's to different backups?
+  Still okay, because any committed operation will be in 2f+1 VIEW-CHANGE msgs
+  of which f+1 must be honest, so at least one member of V will have operation
+  So new primary cannot cause committed operations to be dropped
+  Can only drop operations for which client has not yet seen the answer
+
+How does PBFT deal with non-determinism (Sec. 4.6)?  Two options
+  Option 1: Primary selects value, piggybacks on PRE-PREPARE
+    "replicas must be able to decide deterministically whether... correct"
+  Option 2: Add an extra round to protocol for backups to determine value
+    E.g., backups nominate non-deterministic candidate values
+    Value chose is average, or one with highest hash out of 2f+1 nominations
+    Primary must include 2f+1 nominations as proof this is valid
+  What does BFS use for file mtime?  option 1
+    Weird because not actually deterministically checkable
+    But turns out it works anyway (homework question)
+
+What is the tentative reply optimization?
+  Want to shave one network transmission latency from end-to-end client time
+  r_i tentatively executes m, sends tentative reply once prepared(m,v,n,i)
+      which is before committed-local(m,v,n,i)
+  Client accepts 2f+1 matching tentative replies
+      So f+1 of those replies must be from honest nodes
+      And at least 1 of those f+1 will be part of 2f+1 forming any new view
+      So that 1 node will make sure operation makes it to new view
+  So why do we even need COMMIT messages?
+    Tentative replied convince client that committed(m,v,n)
+    But replicas don't know this!
+      So can't determine outcome of subsequent dependent operations,
+      Can't compute checkpoints, etc.
+  Can tentatively executed requests be undone?
+    Yes, if there's a view change
+    But then client won't have 2f+1 tentative replies, so okay to undo
+
+Strict vs RO
+  strict uses different permissions to access directory (x not r)
+    Does not change atime on directory
+    Remember,
+      atime = access (read) time,
+      mtime = time of last modification,
+      ctime = last time you changed attributes (e.g. deliberately setting mtime)
+  anyways, RO is 2% faster anyways (relying on replication)
+
+How are read-only (RO) requests optimized?
+  Send directly to replicas, replicas send reply directly to client
+    Client waits for 2f+1 matching replies, or restarts as read-write request
+  Replicas must serialize after all prior tentative requests.  Why?
+    For linearizability, RO request might not overlap tentatively executed one
+  What if replicas serialize at different points
+    Might not get 2f+1 matching replies, but that's okay
+  How would this break if REPLY didn't include view number?
+    Could get 2f+1 matching replies from different views
+    Problem if all replied result from tentative operations and none commit
+    Saved by the fact that only one op can prepare for a single view/seq#
+
+BFS-nr: Quorum size of 1. This tells you pure overhead costs for replication
+
+What about compromised clients?  (p. 2)
+  Results of faulty client operations must be consistent
+  Can't violate server side invariants
+  So can rely on authentication and authorization
+    Just like faulty clients with non-replicated service
+
+How do authors evaluate system:
+  Microbenchmark:  null op with empty or 4K request/response size
+  End-to-end file system benchmark vs. NFS and non-replicated BFS
+  Are these the right things to measure?
+    End-to-end benchmarks are good, microbenchmark helps understand them
+    Could ask for more benchmarks, or more services than BFS
+    But compared to prior work, already these results very convincing
+  What's the deal with r/o lookup?
+    On NFS lookup RPC, BFS updates the directory utime, which is expensive
+    Is that right?  No!  Only need "x" permission on directory for lookup
+      Need to read/getdents ("r") a directory or file to change utime
+        Verified on linux and BSD, lookup does not affect directory utime
+    So the authors violated semantics and needlessly penalized themselves!
+
+How might we extend PBFT to tolerate more than (n-1)/3 failures over lifetime?
+  - detect failed replicas using proactive recovery
+    - recover the system periodically, no matter what
+    - makes bad nodes good again
+  - tricky stuff
+    - an attacker might steal compromised replica's keys

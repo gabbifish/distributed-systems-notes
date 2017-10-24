@@ -1,0 +1,219 @@
+Harp
+====
+
+What are the goals of this work?
+  Replicated network file system server with high
+     Durability, Availability, Performance
+  Backwards compatibility with existing clients
+  Backwards compatibility with existing on-disk file systems (VFS layer)
+
+Why not just use viewstamped replication to implement file server?
+  File systems are big; 2f+1 copies is expensive for surviving f faults
+  Sacrifices compatibility with existing file systems
+  Performance might not be good
+    File system layouts heavily optimized for access patterns
+    Somehow need to work client caching into system
+    VR's aid tracking is overkill, would likely hurt performance
+    More availability during view changes
+      Can bring rebooted nodes mostly up to date before interrupting service
+      (VR reduces availability because it blocks responding to requestes until
+      new view is switched to, Harp optimizes state transfer by getting up-to-
+      date info before enacting view change, so it can continue responding to queries).
+    Optimizations for file reads (update atime in background)
+  Semantics might not be as good
+    Harp can survive simultaneous power failure (UPS not optional)
+      In contrast to VR, which will crash if too many machines crash at once.
+    Harp maintains ordering of overlapping operations
+      Implies A-linearizability with TCP (or w. UDP if no packet loss)
+  File systems not allowed to abort transactions like VR module groups
+  Client compatibility?  Maybe okay with server-side NFS-proxy
+
+What is normal-case operation no failures?
+  One designated primary, f backups, f witnesses
+  Client sends request to primary
+  Primary multicasts requests to backups
+  Backups log requests, reply to primary
+  Primary waits for ack from all f backups then replies to client
+  In background, primary tells backups operation committed
+  Witnesses send/receive no messages, do absolutely nothing
+
+Logs often appear below VFS layer (e.g., in ext3)--why does Harp use log?
+  Logging is super fast because it doesn't go to disk
+    Rely on UPS and kernel hack to avoid wiping state in "soft crash"
+  Helps ensure concurrent ops are applied in the same order everywhere
+    Enforces consistent order of linearizability
+  Logs make it easy to bring machines up to date after network partition
+  Weird hack in case FS code vulnerable to "packet of death" (sec 4.3)
+    Apply at primary first (to maintain invariant below)
+    Primary crashes?  View change before applying at backup
+    View change causes witness to log, so no lost state if backup crashes
+
+What are all the different log pointers held at each node (Fig 4-1)?
+  top - most recent log entry
+  CP - most recently committed (primary + all backups have it)
+  AP - most recently applied at local node
+  LB - most recent operation such that it + all prior changes applied to disk
+  GLB - largest index that bounds LB at all nodes
+  Invariant: GLB <= LB <= AP <= CP <= top
+
+What operations lie between top and CP?
+  Concurrent pending operations
+  NFS clients use kernel threads to issue concurrent operations
+  Also, could have multiple clients accessing server
+
+Why not have CP == AP (apply as soon as all backups ack)?
+  Ops are applied in background by a separate apply process
+  Lowers client latency--primary replies as soon as CP passes request
+  All writes async (AP advanced when writes issued, not when completed)
+
+Why not just delay advancing AP until operations on disk, so LB == AP?
+  For performance, want multiple concurrent disk writes from apply process
+    So apply process needs to remember where it is (AP)
+  Also, want primary and backup to be able to overlap writes
+    "Packet of death" trick requires waiting for primary to apply op
+
+Why track the GLB?  Could delete log below LB
+  Can't throw away log records before all backups apply them
+  Might need log to bring other nodes up to date
+
+What is needed for correctness in the face of server failures/view changes?
+  Must ensure only one view active at a time (use majority)
+  Must ensure no events lost across view changes (agree on last op)
+  Must ensure f+1 copies of all committed events (promote witnesses)
+
+What are steps of view change?
+  Phase 0:  Nodes bring themselves up to date after recovery
+    Suffered disk failure+replacement?  Have to copy state from non-witness
+    No disk failure?  Just get log from witness
+  Phase 1:  Coordinator solicits votes
+    At this point, Harp stops processing new client requests
+    Nodes ahead of coordinator send it missing log entries
+    Need f+1 nodes for new view, so can't lose committed op from last view
+  Phase 2:  Coordinator informs nodes of new view
+    Coordinator solicits votes
+      Votes will also contain previous view they were in, and the latest op
+      I think happened
+    Coordinator writes new view number (majority voted) to disk
+    Coordinator brings other nodes up to date if missing log entries
+      If promoting witness, must send it all logs since GLB
+    Other nodes write log entry to disk
+    Witnesses demoted if enough backups in new view
+
+What is the difference between a promoted witness and normal backup?
+  Witness does not have file system state, just log since node failure
+  Hence, can never truncate the log
+
+What could go wrong if witnesses didn't log, but just voted on view changes?
+  Would prevent simultaneous active views, but not prevent data loss
+  E.g., designated primary P, designated backup B, designated witness W
+    Network partition causes B & W to form a view, execute some requests
+    B crashes and loses its disk
+    Network partition heals, P & W form view, but lost ops from previous view
+      (now have only f-1 backups. single copy is missing)
+
+  Trick is: always imagine the node that failed was not the node you thought
+  failed
+
+How are read-only requests handled specially?  (p. 5)
+  Primary can reply immediately without talking to backups
+  "they are serialized at the CP"--why?
+    Anything past CP might not complete successfully after view change
+      E.g., backup never heard of it, then formed view with witness
+      Meanwhile client timed out and gave up
+      Never want to expose uncommitted state
+    Don't want to show clients a write that never happened!
+  But what if backup and witness already formed a new view?
+    Primary of old view could violate linearizability--how?
+      New view could complete a write operation
+      Meanwhile, primary of old view replies to read request with stale data
+    How to avoid?  Assume roughly synchronized clocks for primary lease
+      Backups promise not to form new view for delta milliseconds
+
+Is reading a file a read-only file system operation?
+  Not technically, because you are supposed to update the atime
+  But maybe we don't care if atime not updated in exceptional circumstances
+  So Harp offers a second "weaker" mode of operation
+    Allows small chance that atime update could get lost with failure
+
+Is the file system VFS layer a deterministic replicated finite state machine?
+  I.e., apply same operation on two identical file systems, get same result?
+  No, because file times may not be identical
+    (fully identical results are expected of deterministic replicated FSMs)
+  How does Harp address?  change VFS to allow caller to specify mtime (p. 9)
+
+What's in an event record (Sec 4.4-4.5)?
+  A call to execute on the file system state
+  Enough information to describe the "outcome" of the call completely
+  Why is this tricky for file permissions?
+    E.g., write A (permission denied), chmod A
+    If you replay this log a second time, get different result
+      (permission no longer denied)
+  Why is this tricky for file creation (Sec 4.4, p. 8)?
+    Directory state is more than just file name -> inode mapping
+      At the time, you could read raw directory structures with "cat /dir/"
+      Even today, files stored in a particular order
+      Cookies/offsets used to encode entry positions
+      All of these things depend on order of directory operations
+        create B, create A, unlink A, create A, unlink B
+                                != unlink A, create A, unlink B
+        Replay just the last 3 and will get different result
+    Note simpler example might just be inode number
+      New directories may choose a different inode number than expected
+    Why not store applied actions to log to avoid situation above?
+      Update LB in log to know exactly what has been applied (an async action)
+      Cannot guarantee all info about applied actions will be written to log
+      in advance of a crash.
+
+  Multiple things could go wrong here:
+    Harp has to reply to requests at CP, not AP
+      So needs to be able to predict outcome before applying event record
+    Harp must ensure backups maintain identical state
+  What's the solution?
+    Keep shadow state for inodes and directory pages (Sec 4.4, p. 9)
+    Also presumably need to bypass VFS layer for directory ops as well
+
+Why is fsck a problem? (Sec. 4.3, p. 8)
+  fsck: file system scavenger program, run occasionally on reboot
+    Might have filesystem produce different outcome than that recorded in the
+    log
+    Makes it hard to keep clients in identical state.
+  Attempt to avoid fsck on system except for extreme conditions
+  Completely messes up outcomes like position in directory entry
+
+How to organize multiple file systems with Harp?
+  Spread the load so nodes are primary, backup, witness for different FSes
+
+What happens to duplicate RPCs (same xids, Sec. 4.5)?
+  Client sends request to P, P executes request or sends it to B, P dies,
+    B becomes P, C retransmits request (not idempotent).
+    Need to store client entry in event entry, and cache result to ensure
+    consistent result
+  In single NFS server, should cache reply to avoid re-executing
+  Harp must embed RPC xids in replies so new primary can build replay cache
+
+What if disk write gets corrupted?
+  PBFT will fix this with digests :)
+
+What is comparison point for evaluation?  Single NFS server
+  Is this a fair comparison point?
+    Could also have compared to single NFS server with UPS hack
+  Pro argument:  People tolerate existing NFS performance
+    Harp shows availability/reliability is possible at existing performance
+    Don't need to beet hypothetical world's fastest NFS server to be useful
+  Con argument:  Maybe the UPS story is scary
+    What if UPS fails and you don't learn until it's too late?
+    What if log somehow corrupted during a reboot?
+    Today's datacenters do often have UPSes, so in retrospect looks okay
+
+Why graph x=load y=response-time?
+  Why does this graph make sense?
+  Why not just graph total time to perform X operations?
+  One reason is that systems sometimes get more/less efficient w/ high load.
+  And we care a lot how they perform w/ overload.
+
+Why does response time go up with load?
+  Why first gradual...
+    Queuing and random bursts?
+    And some ops more expensive than others, cause temp delays.
+  Then almost straight up?
+    Probably has hard limits, like disk I/Os per second.

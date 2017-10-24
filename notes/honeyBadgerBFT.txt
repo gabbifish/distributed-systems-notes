@@ -1,0 +1,203 @@
+Honey Badger
+============
+
+Recall FLP (1983):
+    No deterministic consensus protocol can achieve all three of
+    safety, liveness, and fault-tolerance in an asynchronous system.
+
+So far, we have mostly discussed sacrificing liveness
+  Idea: guarantee safety and fault tolerance, terminate in practice
+  Protocol must not get stuck, so always maintain hope of terminating
+
+Another possibility: attack asynchronous system assumption
+  Suppose all nodes can always communicate within T seconds by everyone's clock
+  (So can communicate within T-epsilon real seconds to account for skew)
+Famous Byzantine generals protocol (Lamport,Shostak,Pease) signed variant:
+* Problem statement:
+    General G_0 (possibly a traitor) broadcasts an order (attack or retreat)
+    Other generals compare notes, reach consensus on order
+    If generals don't agree on order, will suffer catastrophic losses
+    At most f faulty generals (including possibly G_0)
+* Protocol
+  Warm-up: at most 0 faulty generals, want consensus on G_0's order
+    Have general G_0 digitally sign and broadcast the order
+    All other generals wait T seconds, get signed order, execute it
+  Normal case: f faulty generals trying to mess up consensus
+    Go through f+1 rounds (0,...,f) of T seconds each:
+      Round 0: General G_0 broadcasts signed order v
+      Round 1: Each other G_i signs G_0's signed order, broadcasts
+      Round r: For each message G_i received in round (r-1) with order v
+        If G_i hasn't yet seen a message with order v
+           then G_i adds its own signature to message (now has r+1 nested sigs)
+                broadcasts message to generals that haven't signed yet
+        Reject messages with fewer than r distinct signatures in round r
+    After round f, will have 0 or more messages each containing some order v
+      General G_i knows that for each of these messages, either:
+        - G_i broadcast the message to all generals that hadn't seen it, or
+        - f+1 generals signed the message, at least one of them is honest
+          the honest general must have broadcast the message to everyone
+      So all honest generals will have same set of orders after round f
+        Will have exactly 1 order if G_0 is honest, just execute it
+        If 0 orders (e.g., G_0 crashed) just execute some default order v
+        If >1 orders, combine deterministically--e.g., take median value
+Interesting properties of Byzantine generals protocol:
+  Survives f failures out of n=f+2 nodes (not bound by 1/3 threshold)
+    (Technically works for n < f+2, but then problem is vacuous)
+  Completely loses safety if synchrony assumption violated
+
+Yet another possibility: partial/weak synchrony (like PBFT)
+  Guarantee safety always
+  Guarantee liveness under certain synchrony assumptions
+    Never get stuck, so can always "fix" network and make progress
+  This is the "winner" in terms of what most real systems use
+
+What if we play with "deterministic" instead of "asynchronous" in FLP?
+  Recall FLP proof considers delivering messages m and m' in either order
+    Assumes if different recipients, either order leads to same state
+    But logic only holds if messages are processed deterministically
+  We've already seen protocol that "never gets stuck"
+    Means there's always some network schedule that leads to termination
+    So keep trying "rounds" (views, ballots, terms, etc.) until one terminates
+  If network were random, we could talk about round termination probability
+    Unfortunately, network is hard to model / controlled by adversary
+  Can we instead make probability dependent on nodes' random choices?
+
+In response to FLP, Ben Or proposed the following protocol in 1983:
+  Goal: consensus on one bit (a.k.a. asynchronous binary agreement, or ABA)
+  Assumes at most f faulty nodes out of N>5f (sic, not N>3f) nodes
+
+  Each node i starts with input bit x_i, then executes:
+    int x = x_i; // i's input bit
+    for (round = 0;; ++round) {
+      broadcast <VOTE, round, x>
+      wait for N-f VOTE messages in round (including i's own)
+      if more than (N+f)/2 VOTEs have same value v
+        then broadcast <COMMIT, round, v>
+        else broadcast <COMMIT, round, ?>
+      wait for N-f COMMIT messages in round (including i's own)
+      if more than f+1 COMMIT messages have same value v != ?
+        then set x=v; if more than (N+f)/2 COMMIT v
+                          then output x as consensus value
+        else set x to a random bit
+    }
+
+Analysis:
+  Note: > (N+f)/2 nodes includes a majority of non-faulty nodes
+      Majority of non-faulty nodes is > (N-f)/2 non-faulty nodes
+      Plus f faulty nodes means > (N-f)/2 + f = (N+f)/2
+  Hence, in a round, all non-faulty nodes must COMMIT same value unique v != ?
+    But some or all non-faulty nodes may COMMIT ? instead
+  If you receive f+1 COMMIT v != ?, you know v must be the unique COMMIT value
+    After all, at most f of those nodes will be lying
+  If you receive C COMMIT v and C > (N+f)/2
+    Each other node i will see at least C-2f COMMITs for v
+      because f of your C could double-vote, and another f could be slow to i
+    But C-2f > (N+f)/2 - 2f = (N-3f)/2 > (5f-3f)/2 = f  [since N>5f]
+      So every other non-faulty node will see f+1 COMMITs for v
+      Means all other non-faulty nodes guaranteed to terminate in next round
+  If you flip a coin
+    Could luck out and have all non-faulty nodes flip same value
+    So protocol guaranteed to terminate eventually with probability 1!
+
+So why not use Ben Or instead of PBFT?
+  Only agrees on one bit, not arbitrary operation
+  Exponential expected number of rounds required when flipping coins
+
+Rabin's idea (1983): What if everyone flipped the same *common coin*?
+  Can use a deterministic threshold digital signature scheme
+    E.g., threshold RSA with full-domain-hash
+  Sign message "(consensus instance, round number)"
+    Take low bit of SHA256(signature) as common coin value
+  Attacker doesn't learn coin until too late to send COMMITs
+  Rabin's trick:  Randomize vote threshold between N/2 and (N-2f)
+    Bad network can't split over threshold if it can't predict threshold
+    But all nodes can use the same threshold based on common coin
+  But see MostÃ©faoui [43] for a much better protocol using this idea
+  Caveat: common coin requires trusted dealer or fancy crypto
+    Somehow need to get nodes shares of the same private key
+    (Or in Rabin's case direct shares of a sequence of one-shot random bits)
+
+What is asynchronous Reliable Broadcast?
+  Set of nodes {P_i} including distinguish sender P_S that has input h
+  If P_S is non-faulty, all non-faulty nodes deliver h
+    else, either all non-faulty nodes deliver same h', or none terminate
+  Boils down to:
+    agreement - all non-faulty node outputs are identical
+    totality - all non-faulty nodes output a value or none terminate
+    validity - if P_S non-faulty, then all non-faulty nodes output h
+How would you do simple (Bracha-style) RBC w/o erasure coding, N > 3f?
+  P_S broadcasts VAL(h)
+  P_i receives VAL(h), broadcast ECHO(h)
+  P_i receives N-f ECHO(h) messages, broadcasts READY(h)
+  P_i receives f+1 READY(h), broadcasts READY(h) [if hasn't already]
+  P_i receives 2f+1 READY(h), delivers h
+Why does this work?
+  N-f nodes includes majority of non-faulty nodes
+    So READY from all non-faulty nodes will have same value h => agreement
+    If P_S non-faulty, will all contain P_S's input h => validity
+  If 2f+1 nodes send READY(h), f+1 will be non-faulty
+    Those f+1 will convince all other non-faulty nodes to broadcast READY(h)
+    Since N>3f, will get 2f+1 properly broadcast READY(h) => totality
+
+How does erasure coding improve efficiency?
+  What if h is big?  P_S will have to send many copies
+    Instead, make h a cryptographic hash
+    But use merkle tree so can individually verify any block of message from h
+  Erasure coding: make n>k shares of k-block msg, so any k reconstruct msg
+  Change protocol to broadcast VAL(h,b_i,s_i), ECHO(h,b_i,s_i)
+    s_i is share of message, b_i is proof that it is in hash tree with root h
+  Wait for N-f ECHO messages (guaranteed to get if 2f+1 READY(h)), reconstruct
+
+Why doesn't RBC give us consensus with following straw man?
+  Every node RBCs its own input (N instances of RBC)
+  Non-faulty nodes guaranteed to converge on same set of inputs
+  Combine inputs deterministically (e.g., output median value)
+Red flag: can't be right, would violate FLP (not randomized)
+Problem: guaranteed to converge, but nodes don't know when
+  Might not get RBC from faulty senders, but don't know which are faulty
+  A node risks outputting median value before hearing all inputs
+
+What is asynchronous common subset (ACS)?
+  Each node P_i has input v_i, must output some set of values
+  Goal: all non-faulty nodes output same set V of values
+    V must encompass inputs of N-2f nodes
+  Boils down to:
+    validity - any non-faulty node output contains N-2f non-faulty node inputs
+    agreement - if any non-faulty node outputs set V, all output same set V
+    totality - if N-f non-faulty nodes get input, all non-faulty produce output
+How to build ACS from RBC and ABA?
+  Start out like straw-man above: each P_i RBCs v_i (N instances of RBC)
+  But now use N instances of ABA to pick at least N-f of these RBCs:
+
+    while (fewer than N-f RBCs have delivered a value
+           && fewer than N-f ABA instances have output 1) {
+      if (RBC_j delivers v_j)
+        Supply 1 as input to ABA_j
+    }
+    Supply 0 as input to any remaining ABAs we haven't started yet
+    Output { v_j | ABA_j output 1 }  [waiting for RBCs if necessary]
+
+Why does this ACS work?
+  RBCs and ABAs have identical outputs at all non-faulty nodes => agreement
+  N-f RBCs will eventually deliver a value (by totality of RBC) => totality
+    All nodes will exit the while loop
+    If ABA_j == 1 at any non-faulty node, then RBC_j will deliver v_j
+  At least N-f ABA must output 1 => validity
+    Because N-2f must correspond to non-faulty nodes
+
+How to enhance throughput?
+  Try to run RBC on different values by picking randomly from large buffer
+How does this enable censorship w/o threshold encryption?
+  Say attacker controls network and f nodes
+  Ensure whatever node RBCs victim transaction is always slow
+  Allows attacker to keep some transaction from ever being included
+How does threshold encryption solve?
+  Attacker doesn't know who has RBCed what transactions until it is too late
+
+Would you use HoneyBadgerBFT for a network file system like BFS?
+  No - very high latency (10s of seconds) would give unusable performance
+  Also doesn't take advantage of physical-layer multicast
+
+Why use HoneyBadgerBFT instead of PBFT?
+  High throughput with many replicas, big batch sizes
+  No need to worry about tuning timeouts

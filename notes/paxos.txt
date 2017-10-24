@@ -1,0 +1,273 @@
+Paxos
+=====
+
+State machine replication review
+  Boils down to a consensus problem for each slot in an operation log
+
+FLP review: In a deterministic, asynchronous consensus system
+  Pick at most two of: safety, liveness, fault-tolerance
+How might you achieve safety and liveness?
+  Two-phase commit--safe, and guaranteed to terminate in two phases
+  Or simpler: one-phase commit (take whatever lowest-numbered node says)
+How about liveness and fault-tolerance?
+  E.g., Every node broadcasts its input value
+        wait 5 seconds then chose lexicographically lowest value seen
+  Guaranteed to terminate in 5 seconds (if any node non-failed)
+  But network partition could prevent agreement
+What about safety and fault-tolerance?
+  In theory, this is what viewstamped-replication gives us
+  But VR gives us more... how about something simpler?
+
+Straw-man non-live consensus protocol:
+  Everybody broadcast value, wait 5 seconds
+  Every node votes for lowest value seen (and can never change vote)
+  If some value receives a majority, output it
+  Otherwise, you are "stuck" and there is no liveness
+    E.g., 2f+1 nodes total, f voted for 0, f voted for 1, and 1 node failed
+    Or no failures but three-way split between values 0, 1, and 2
+Neither VR nor straw-man have liveness.  Why is VR better?
+  Straw-man gets stuck with split votes
+  VR never gets stuck; even if it hasn't terminated, there's always hope
+
+
+             f+1 0 votes +--------+            +---------+
+            +----------->|0-valent+----------->|learned 0|
+            |            +----+---+            +---------+
+            |                  \
+  +---------+                   \              +---------+
+  |Undecided+--------------------+------------>|  stuck  |
+  +---------+                   /              +---------+
+            |                  /
+            |            +----+---+            +---------+
+            +----------->|1-valent+----------->|learned 1|
+             f+1 1 votes +--------+            +---------+
+
+
+Some important conclusions from discussion thus far:
+  - Voting is a key technique providing both safety and fault-tolerance
+  - But votes can split and produce permanently indeterminate outcomes
+  - Or failed cohorts + lost votes mean never learn system 0/1-valent
+  - So better NOT vote on questions you can't afford to leave indeterminate
+    (e.g., what is the 5th operation in the state machine log)
+
+Key idea in many of these protocols:
+  Carefully craft statements on which nodes vote
+  Either avoid possibility of split vote
+  Or ensure indeterminate outcome won't permanently block log consensus
+  Again, can't directly vote on log entries (e.g., "log index 5 is x")
+Two types of statement are safe to vote on:
+* Irrefutable statements: while relevant, no one ever votes against
+    In VR, at most one possible event for a given viewstamp
+    So during view change, always free to vote for <vs, event>
+      Either a cohort never acked any event at vs, so free to ack
+event
+      Or a cohort already acked <vs, event>, and happy to repeat
+* Neutralizable statements: indeterminate outcome won't prevent consensus
+  (e.g. vote to form a new view)
+    In VR, might fail to form a particular view
+      Nodes might timeout, move on to higher view
+      View manager might fail
+      Or might try to form with too low a previous viewstamp
+        [might depends on exact instantiation of viewstamped replication]
+        E.g., f+1 nodes accept to form view vid with normal_viewid vs
+        1 of the f fails, and remaining (slower) cohorts saw vs' > vs
+    No big deal, just "neutralize" the view by trying a higher viewid
+
+Viewstamped replication (and Raft) from 50,000 feet:
+  Have a single leader sequentially number all operations <viewstamp, op>...
+  Have nodes vote on the operation corresponding to each viewstamp
+    Only one leader per view, so this mapping is irrefutable
+    Hence liveness guaranteed until you lose (or think you lost) leader
+  Lost leader?  Must vote on (new viewid, new leader, last included viewstamp)
+    By irrefutability, stale nodes can always increase last include viewstamp!
+    Leader vote could be indeterminate, but it's neutralizable!
+    A failed view doesn't preclude successful views with higher viewids
+
+  Performing a view change
+                  +---------+---------+---------+
+      View 1      |   OP1   |   OP2   |   OP3   |
+                  +---------+---+-----+----+----+
+                                |          |
+                                |     +---------+---------+
+      View 2                    +---> |   OP1   |   OP2   |
+                                      +---------+---------+
+                                           |
+                                           |    +---------+---------+
+      View 3                               +--->+   OP1   |   OP2   |
+                                                +---------+---------+
+
+  For View 2: no other operations contest fact that view2 is off view2
+  (voted to agree that view2 is the one followed)
+  For View 3: too many nodes see OP3 and follow it, so OP2 is neutralized.
+
+Neutralizing statements with Ballot Numbers
+
+    +----------+
+    |  log 2   |
+    +----------+
+    |          |
+    |          |
+    |    ?     |
+    |          |
+    |          |
+    +----------+
+
+  try
+    vote ? = OP2
+  if gets stuck,
+    vote ? = OP3
+
+Now let's try a different approach:  numbered ballots
+  Vote for log entries, but associate each vote with a ballot number
+    E.g., "I vote that log index i contains value v *in ballot #b*"
+  Approximate idea: Suppose ballot b is indeterminate
+    ...neutralize it by proceeding with a higher-numbered ballot
+
+The complication:  An indeterminate ballot didn't necessarily fail
+  A node might irreversibly *externalize* a value and then fail
+    The network could lose the last messages sent by such a node
+    Yet once externalized, a value must be chosen (e.g., authorized purchase)
+  Example: 7 nodes (n1, ..., n7).
+
+      +------+------+------+------+------+------+------+
+      |  n1  |  n2  |  n3  |  n4  |  n5  |  n6  |  n7  |
+      +------+------+------+------+------+------+------+
+       fails     X             X      X             X
+                 XXXXXXXXXXXXXXX      XXXXXXXXXXXXXXX
+                  vote < b, v >       vote < b', v' >
+                                          b' > b
+
+    - n2-n4 vote for value v in ballot #b
+    - n5-n7 never heard of v, voted for v' in ballot #b' (b' > b)
+    - n1 died at some point, but might have voted
+  Now what?  Both ballots b and b' are stuck.  Did they fail?
+    Or did n1 vote for and externalize v?  Or did it externalize v'?
+  Can't completely neutralize an indeterminate ballot!
+
+Solution:  Conservatively assume indeterminate ballots may have succeeded
+  Note, if v' = v above, there is no problem
+  So if ballot b indeterminate, ensure all future ballots use same value
+
+The (single-decree) Paxos protocol:
+* Paxos is all about making sure all successful votes and stuck votes are for
+  same value!
+* Establish irrefutable mapping between ballot # and value
+    Ballot = referendum on one value, not choice between candidate values
+    Each ballot proposed by a single leader, has single value
+    Embed leader's unique machine-id inside ballot number
+* Before voting on value in ballot b, *prepare* b by checking previous ballots
+    Leader broadcasts "PREPARE b"
+    Cohorts reply "PREPARED b { NULL | <b_old, v_old> }"
+      b_old is the last ballot in which cohort voted before b
+      v_old is the value in ballot b_old
+      Cohort promises conditions will still be true when acted on by leader
+        ...implies promise never to vote for any ballot between b_old and b
+    Ballot b prepared after getting PREPARED from a majority of nodes
+    If all PREPARED messages have NULL, leader can use any value v
+      -> Because you can assume the outcome was learned (new value will not contradict a nonexistent older value)
+    Otherwise, highest b_old is indeterminate (or successful)
+      Leader must set v = v_old corresponding to highest b_old
+    (This prepare phase is used to ensure that if someone submits multiple
+    ballots, they are the same number. So it's okay to submit multiple ballots!)
+* Now can vote on value v
+    Leader broadcasts "COMMIT b v"   [a.k.a. "accept b" in paper]
+    Cohorts reply "COMMITTED b"
+    After collecting COMMITTED from majority of replicas, consensus on v
+      (Learners record this outcome)
+
+When is it safe for backups to apply message to replicated state machine?
+  After learning acceptance decisions of all acceptors and noting majority
+  COMMIT.
+
+Can add extra field "a" to ballot that is true or false:
+  if true, all future slots in logs are managed by a leader
+  (all at once, leader prepares log, and at steady state, send commit messages)
+
+No need to tell backups about transaction succeeding, they will just rerun Paxos
+and the outcome is the only value they'll be able to choose.
+
+If two nodes attempt to become leaders, the one with the higher ballot number
+will become leader; other node will simply adopt leader's ballot number.
+
+Why is Paxos hard to understand?
+  Conjecture: it conflates irrefutable and neutralizable messages
+Another way to view Paxos: Translate concrete messages to conceptual ones
+  The conceptual protocol:
+    * commit b v: Vote for consensus on value v in ballot #b
+    * abort b v:  Vote that ballot #b not reach consensus on value v
+    Invariant: For each b, can only vote "commit b v" for a single value v
+      Value is determined by leader of ballot b (whose id is embedded in b)
+      Makes mapping of b -> v irrefutable
+    Invariant: can only vote "commit b v" after a majority votes for
+          { abort b' v' | b' < b && v' != v }
+      When such abort messages garner majority, we say (b, v) is prepared
+  The concrete to conceptual mapping
+    * PREPARED b <b_old, v_old>:
+        { vote for "abort b' v'" | b_old < b' < b } [for all values v']
+        { assert "abort b' v'" got majority | b' <= b_old && v' != v_old }
+    * COMMITTED b
+        vote for "commit b v", { "abort b v'" | v' != v }
+        v is (irrefutable) value from COMMIT b v
+So Paxos uses same tools (irrefutable/neutralizable statements)
+  ... but in much more complicated way
+
+Simple way to use paxos with replicated state machine:
+  One paxos instance per log entry (slot), specified in messages:
+    PREPARE i b, PREPARED i b {NULL|...}, COMMIT i b, COMMITTED b
+Can we optimize multi-paxos for only one round trip in common case?
+  Yes.  Use same ballot number for all paxos instances
+  * PREPARE i b: prepares ballot b for all slots i' >= i
+  * PREPARED i b {NULL|<b_old,v_old>} a:
+      - <b_old, v_old> is last COMMIT sent for ballot b
+      - a is bool, if TRUE, means use NULL for "all future slots" (i' > i)
+        This is the common case; means all slots >= i are now prepared
+        If a is FALSE, then must issue PREPARE (i+1) b
+When can you apply an log index to state machine and reply to client?
+  When leader receives COMMITTED i b from a majority.  How do cohorts know?
+  Can piggy back on new messages:
+  * COMMIT i b v i_min:
+      - i_min is says all slots i' < i_min committed with ballot # <= b
+        So cohort that voted COMMIT i b v can mark (i, v) as committed
+        Cohort that voted COMMIT i b' v' for b' < b can't commit v'
+          must contact peer to learn value of v; but this is not common case
+Convenient extensions to avoid full protocol or other delays where unnecessary
+  * PREPARE i 0
+      Special ballot 0 probes slot without trying to become leader
+  * LEARN i v:  Reply to request concerning already committed slot i
+      A single LEARN message enough to externalize v, no need to hold vote
+      Alternatively, LEARN i v =~ PREPARED i <INFINITY, v> FALSE
+  * STATUS i_min b:  Reply to request with current slot but stale ballot number
+      Says, sorry, I've promised to ignore all ballots <= b
+  Note these are only optimizations, not required for correctness
+
+Reconfiguration:  How to add and remove servers?
+  Use the log!  Have distinguished log values that add/remove nodes
+  Danger:  Better not commit values unless you know what a majority is!
+           Better not even prepare values unless you know what a majority is!
+  Lamport's solution?
+    Log index i changes system composition for slot i+alpha
+    Places bound alpha on number of uncommitted requests (operations in flight)
+    Fill log with nops if you had fewer than alpha outstanding operations
+  Your humble instructor's solution:
+    Unlimited pipelining of normal requests
+    But only commit values in order (probably want this anyway)
+      Ensures you always know what majority is before deciding COMMIT majority
+    Don't pipeline *any* COMMIT messages behind COMMIT i b v that reconfigures
+      Ensures you always know ballot is prepared before sending COMMIT.
+        (NEVER SEND COMMIT MSG BEFORE BALLOT IS PREPARED!)
+
+What kind of synchrony assumptions could guarantee liveness with Paxos/VR?
+  If you know range of message latencies, set timeout appropriately
+  If you don't, make more limited assumptions
+  Example:  Assume message latencies don't grow exponentially
+    Can keep doubling timeout before starting new ballot/leader election
+
+Dirty secret:  Most people think Paxos and VR are same protocol
+  (Your instructor wrote paper about VR called Paxos Made Practical...oops)
+  See https://www.cs.cornell.edu/fbs/publications/viveLaDifference.pdf
+
+Does Paxos have any advantages over VR/Raft?  Maybe
+  Leader change shares more code paths with normal operation
+    Conjecture:  may be easier to test, leave fewer weird corner cases
+  Greater symmetry makes it adaptable to less centralized situations
+    Topic of research I'll tell you about in last lecture

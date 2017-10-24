@@ -1,0 +1,162 @@
+A New Presumed Commit Optimization for Two Phase Commit
+=======================================================
+
+Say you want to move $100 from account A to account B at a bank
+  Such a transaction could fail depending on state of ledger
+  E.g., Account A has insufficient funds, or either account deleted
+Want serializability - as if all transactions executed in some order
+  Concurrent transactions on A and B must not interfere
+    Read B, write B+100 must be equivalent to atomic B += 100
+  Everyone must agree on exactly what transactions preceded this transfer
+    Otherwise, say A only has $100 but attempts two payments to B and C
+      If neither transaction sees the other, both will succeed
+    Or say A and B each move $1M (they don't have) to the other
+      Transfers could succeed if each transaction thinks other happened first
+Want recoverability - transaction is atomic (all or nothing)
+  Debit A iff credit B, even with power failures, crashes, etc.
+
+Say bank ledger is in an RDBMS--how do we achieve these properties?
+  Serializability - take out locks on both accounts before moving money
+  Recoverability - generally use a write-ahead log
+    Write atomic idempotent description to log before changing B-trees
+    Post-crash, log replay has same effect regardless of B-tree state
+    Alternatives: keep undo log (SQLite), DO-UNDO-REDO logging, etc.
+  Note: locks can fail or be revoked, in which case RDBMS aborts transaction
+    Aborted transaction has no effect on database contents
+    Must be reported to client, which tries again or gives up
+
+Say ledger is large, must be sharded, with A and B in separate RDBMSes
+  Naive approach, two transactions on two RDBMSes--what goes wrong?
+  Serializability - say concurrent payments T1:A->B($100) and T2:C->A($100)
+    A in DB1, B+C in DB2: DBs could see to payments in different orders
+      T2: lock C
+      T1: lock B, lock A, commit, release locks
+      T2: lock A, commit, release locks
+    Even if linearizable, T2 can order T2 before overlapping T1
+  Recoverability - What if T1 commits on DB2 but aborts on DB1?
+
+Solution?  Use 2PC to ensure *all* DBs either commit or abort
+  Acquire a bunch of locks, finish your transaction, decide to commit
+  Phase 1: Preparing
+    Coordinator broadcasts PREPARE to all cohorts (DBs in transaction)
+    Up to this point, each cohort can abort (e.g., if it revoked lock)
+    If a cohort aborted, responds with ABORT-VOTE
+    Otherwise, respond COMMIT-VOTE: now can't abort or touch locks!
+  Phase 2: Committing/aborting
+    If any cohort voted ABORT-VOTE, coordinator broadcasts ABORT message
+    Otherwise, if all voted COMMIT-VOTE, then coordinator broadcasts COMMIT
+    If COMMIT, cohorts *must* commit transaction
+    Only now can cohorts release any locks associated with transaction
+    Cohorts reply with ACK so coordinator knows they received outcome
+  Does this solve recoverability?  Yes if everything logged
+  Does it solve serializability?  Possibly
+    DB2 must commit T1 before learning whether or not T2 committed
+    But T2 could still have a lower timestamp than T1 on DB2
+    Okay if you assign timestamp in Phase2 (e.g., on receipt of PREPARE)
+      At that point, all associated locks held on all cohorts
+
+When must a cohort force-write something to disk?
+  Before sending COMMIT-VOTE?  Always
+    COMMIT-VOTE is a promise not to abort transaction or release locks
+    If cohort reboots with no record of promise, can't possibly keep it
+    E.g., before hearing from coordinator of transaction it forgot about,
+          might agree to commit conflicting transaction with other coordinator
+  Before sending ACK?  Depends on variant
+    Naively yes, because it should permanently commit/abort transaction
+    But if it crashes, will know transaction existed from COMMIT-VOTE record
+    If coordinator remembers what happened, cohort can just ask it
+    Whether an ACK message is even required (and associated write) depends on
+      - What information coordinator retains
+      - Whether transaction committed or aborted
+  How much to we care about these forced writes?
+    COMMIT-VOTE is on the critical path for transaction latency
+    ACK is not--coordinator already knows transaction committed
+      So disk latency won't affect transaction latency
+      Maybe delay, piggyback on another log write for better throughput
+      Possibly unfair of paper to lump these together in single "n" value
+
+When must coordinator force-write in paper's PrN variant?
+  Before sending PREPARE?  No (only if pedantically presuming nothing)
+    Until it sends COMMIT, coordinator can unilaterally ABORT a transaction
+    Cohort inquires about unknown transaction?  coordinator "presumes" abort
+  Before sending COMMIT?  Yes
+    At this point transaction happened, so need to record it durably
+    Otherwise, couldn't properly respond to cohort inquiries after crash
+  Before sending ABORT?  Yes
+    This is the part about presume nothing
+  Upon receiving ACK?  No (non-forced write)
+
+Fill in a table during lecture
+                            PrN    PrA   PrC   NPrC
+       log before PREPARE   N      N     Y     N
+       log before COMMIT    Y      Y     Y     Y
+       log before ABORT     N      N     N     N
+       ACK after COMMIT     Y      Y     N     N
+       ACK after ABORT      Y      N     Y     Y
+  (Note: cohorts log before COMMIT-VOTE in all schemes)
+
+How does presumed abort (PrA) differ from PrN?
+  Don't write to disk before sending ABORT
+    Coordinator never writes aborted transactions--no garbage to collect
+      No matter when coordinator crashes, nothing on disk
+      So cohorts inquiring about transaction will always get same answer
+    Hence, cohorts don't even need to send ACK message to ABORT
+      And hence obviously no force-write before (non-existent) ACK message
+  But COMMITs (common case) are exactly same cost as PrN
+
+What are costs for traditional presumed commit (PrC)?
+  Coordinator writes before PREPARE?  Yes
+    Otherwise, after crash would presume committed if cohort inquired
+    Without all votes, coordinator can unilaterally ABORT but not COMMIT
+  Coordinator writes before COMMIT?  Yes
+    Have to log to "undo" effect of log record before PREPARE
+    Otherwise, would see transaction after crash and abort it
+    But cohort doesn't have to ACK COMMIT
+  Coordinator writes before sending ABORT?  No
+    But cohorts must ACK ABORT
+    And coordinator has one more non-forced cleanup write when all ACKs in
+
+What's the read-only optimization?
+  Transaction might be read-only at one cohort
+    Only effect is to hold locks for duration of transaction
+    So cohort doesn't care whether transaction commits or aborts
+  Cohort replies to PREPARE with READ-ONLY-VOTE
+    Also releases all locks when it sends READ-ONLY-VOTE
+      any locked data unmodified since transaction read-only at cohort
+    Coordinator doesn't send COMMIT/ABORT message to read-only cohort
+  If all cohorts reply READ-ONLY-VOTE, then whole transaction read-only
+    If coordinator didn't log PREPARE message, doesn't need to log anything
+      Cohorts don't care whether committed or aborted
+    With PrC, must write (non-forced) record to delete logged PREPARE message
+
+What's the idea behind the NPrC optimization?
+  Trade garbage collection after crash for messages+writes
+  Window of recent transaction ids (tid_l,...,tid_h) presumed aborted
+    All other transactions presumed committed
+  Must stably log the window parameters (tid_l,tid_h)
+    tid_h can be implicit based on highest stable transaction
+      or can be explicitly logged but amortized over many transactions
+      must guarantee no tids >= tid_h ever used
+    tid_l piggybacked onto other log writes
+      points to oldest "undocumented" transaction
+  Now no need to log before sending PREPARE when in window (common case)
+    Can always log PREPARE of slow ("recalcitrant") transaction later
+    Logging PREPARE allows tid_l to advance despite a few stragglers
+  But also no need for cohorts to ACK COMMIT messages!
+    Because tid_l suffices for coordinator to "remember" an arbitrary
+    number of committed transactions cohorts might ask about
+  Only common-case forced log write is before sending COMMIT
+
+What happens if NPrC coordinator crashes while committing tid?
+  If tid >= tid_l, then disk will contain COMMIT log record
+  If tid < tid_l, then will presume committed, so no need for record
+What happens if NPrC committed crashes while aborting tid?
+  Won't advance tid_l > tid until all cohorts ACK the abort
+  So either tid > tid_l and presumed aborted, or no cohorts will inquire
+
+What is garbage collection issue?
+  Never logged PREPARE? won't know what cohorts involved in transaction
+    Can't collect ACKs for ABORT, have to be prepared for inquiries
+    No time bound on unknown cohorts inquiring about unknown transactions
+  Solution is keep permanent record of presumed abort ranges after each crash
+  Could alternatively keep track of all possibly active cohorts

@@ -1,0 +1,58 @@
+RAFT
+====
+
+Goal: consistent key-value store
+  - Want it to be consistent (like single machine) and deal with failures at
+    the same time
+  - Recovers from server failure autonomously:
+    * minority of servers fail: no problem
+    * majority fail: lose availability but retain consistency
+
+Replicated state machine
+  - Every machine has event log and voting permissions
+  - Consensus ensures proper log replication
+  - System makes server as long as majority of servers are up
+  - failure model: fail-stop (non-Byzantine) and delayed/lost msgs.
+
+How is Consensus used in general?
+  - 2PC used to agree on database entries and replicate entire databases
+  - All clients connect to leader, who is supposed to ensure consistency with
+    backups.
+
+Raft Overview
+  1. Leader election
+    - select one of the servers to act as cluster leader (send heartbeats to
+      remain leader)
+    - detect new crashes, or do not receive heartbeat before timeout ->
+      become new leader candidate and start leader election, choose new leader
+    - heartbeats and timeouts to determine crashes
+    - randomized timeouts to avoid split votes
+    - majority voting to elect one server per term
+  2. Log replication (normal operation)
+    - leader takes commands from clients and applies them to its log
+    - leader replicates its log to other servers (overwriting inconsistencies)
+    - built-in consistency check simplifies how logs may differ
+  3. Safety
+    - only server w/ up-to-date log can become leader (only elect leaders with
+      all committed entries in their logs)
+    - new leader defers committing entries from prior terms
+
+Stuckness can happen when even # of backups vote for two candidates
+  - very rare edge case of edge case (leader crashes, multiple servers time out
+    at same time, HAPPENS that vote splits across them)
+  - just let election time out and do it over.
+  - Check out visualization on https://raft.github.io/raftscope-replay/
+
+When majority of cluster has entry
+  - leader can call for that entry to be committed.
+  - for other backups to learn entries, each backup maintains a "next index"
+    that is backed up until a consistent value with leader is reached. Then
+    the backup will copy entries from leader COMMITTED log until they match.
+
+Voting Rule
+  - when voting, servers will send out lengths of their log entries. Longest
+    log implies more up-to-date info and inclusion of entire committed logs.
+  - to be elected as leader, your log needs to be "better". Needs to contain
+    all entries committed already.
+
+DO NOT EXTERNALIZE (RETURN TO CLIENT) ANYTHING THAT IS NOT COMMITTED!

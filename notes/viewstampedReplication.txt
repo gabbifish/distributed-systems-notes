@@ -1,0 +1,256 @@
+Viewstamped Replication
+=======================
+
+Clarification on serializability (I was unclear Monday)
+  Two-phase locking is acquiring all locks before releasing any
+  Two-phase locking guarantees serializability even in distributed system
+    Assumes each participant orders transactions by COMMIT-VOTE time
+    Because at that point (in prepare phase), all locks are held by all cohorts
+
+Almost nobody seems to understand how to implement consensus
+  They know you use "Paxos" for consensus, but don't know what that is
+  My theory:  We've been teaching wrong
+    Notably, actual paxos paper (The Part-Time Parliament) unreadable
+    Also, VR (today) blurs abstraction barrier between consensus and 2PC
+  Another theory:  These protocols are wrong because they are hard to teach
+Plan for the next three lectures:
+  Today:  The protocol many people incorrectly call Paxos
+  Monday:  The actual Paxos protocol, and how to think about it
+  Wednesday:  Raft--a protocol designed to be easier to understand
+    Guest lecture from Raft designer, representing the other opinion
+    (I endorse Raft, just think it should be understood in broader framework)
+
+The big picture for VR
+  We have *modules*, which are collections of objects (think database)
+  We want serializable, recoverable transactions across different modules
+  Modules may be on different machines, so use 2-phase commit
+  For availability/reliability, replicate modules into *module groups*
+    A module group is a set of cohorts storing an entire copy of the module
+  Replication poses challenges
+    Implies the need for consensus across cohorts in module group
+    Need to reconfigure group if cohorts fail or are unreachable
+    Some state/history could be lost during reconfiguration
+    Must recognize transaction depending on lost state and vote to ABORT
+  Design point also eschews stable disk writes for replication (homework)
+    Questionable... can't survive ubiquitous power outage without UPSes
+    But techniques introduced can be adapted to survive power failure
+
+Let's first think about how to implement module groups
+  To simplify, say module group does single-RPC transactions, so no 2PC
+  Example:  credit card payment server with RPC-driven state machine:
+  * CHARGE (transaction-id, CC #, merchant, amount) -> {approved, denied}
+    - Merchant issues RPC when customer pays for item
+    - If system says approved, customer can leave with merchandise
+  Obviously don't want to forget about transactions if server fails
+  So replicating in case of server/disk failure is a good idea
+  Note also that we care about order of transactions
+    If CC# gets two large charges, only first executed one might succeed
+
+First attempt:  Simple protocol like two-phase commit
+  Designate one server the primary (~coordinator), and the others backups
+  Client:
+    - sends CHARGE RPC to primary
+  Primary:
+    - assigns the RPC a consecutive sequence number
+    - implicitly votes to COMMIT the transaction, logs it
+    - broadcasts PREPARE message containing: { sequence number, CHARGE args }
+  Backups:
+    - if sequence number not greater than all others seen, reply ABORT-VOTE
+    - otherwise, log PREPARE message to disk and send COMMIT-VOTE
+  Primary:
+    - Transaction commits if *all* backups vote COMMIT
+    - Log transaction to disk either way
+    - Broadcast transaction result to backups
+    - If transaction ABORTed, conservatively send back denied to client
+    - If transaction COMMITted, execute and send result to client
+  Backups:
+    - Log outcome and reply ACK to primary
+    - If don't hear from primary, ask it
+  Primary:
+    - Periodically send END record for highest seq# ACKed by all cohorts
+    - Cohorts can forget about transactions before END
+
+What happens if one of the backups fails?
+  System grinds to a halt
+  But N-1 replicas of the data still exist
+  So human operator can just configure system to have only N-1 replicas
+    If remaining replicas all voted to COMMIT, safe to do so
+  Now can continue operation with no lost data
+
+What happens if primary fails?
+  Customer either walked out with item or not, want charge to match
+  If any replica didn't vote COMMIT, customer doesn't have item, so ABORT
+      E.g., replica might never even have received the PREPARE
+  If all replicas voted COMMIT, then customer may have gotten item
+      or may still be waiting for approval in store
+    So put charge through; client can re-transmit CHARGE RPC if necessary
+      Note transaction Id in CHARGE RPC makes it idempotent
+  Once you determine transaction status, make another node the new primary
+
+What happens if primary and another replica both fail?
+  If all surviving replicas voted COMMIT, we are in trouble
+    Customer may have left with item, may have left w/o item, may be waiting
+  So 2PC was probably the wrong protocol to use
+
+Second attempt:  Use *three*-phase commit
+  Problem was "prepared" state where replicas can go either way
+  So now after PREPARE, if everyone votes COMMIT, broadcast PREPARE-COMMIT
+  Once all participants "PRE-ACK" PREPARE-COMMIT, broadcast COMMIT
+  After failure, COMMIT if and only if any survivor saw PREPARE-COMMIT
+  Why is this better?
+    2PC: execute transaction once everyone willing to COMMIT it
+    3PC: execute transaction once everyone *knows* everyone willing to COMMIT
+      Customer only gets item when everyone knows charge safe to COMMIT
+  But still two problems:
+    3PC is expensive to do for each operation
+    Need human operator to configure primary and #replicas after each failure
+
+Can we fix 3PC to recover from failure automatically?  No.
+  3PC is guaranteed to reach consensus if no machine fails
+  Remember FLP?  Can't guarantee termination if protocol is fault-tolerant
+    But in an asynchronous system, failed machine looks like slow machine
+      ... and consequently slow machine looks like failed machine
+    E.g., might time out and initiate recovery for machine that didn't fail
+  So counter-intuitively, to achieve fault-tolerance we must use...
+      a protocol that's *not* guaranteed to terminate even without failure!
+    But we can make it terminate in practice even with failure
+
+Some basic VR module group concepts:
+  GroupId: Unique identifier of group
+  Mid: Module Id uniquely identifies cohort
+  Configuration: The total set of cohorts (failed and not) in group
+  View: Functioning subset of configuration with designated primary cohort
+  ViewId: <counter, mid> pair uniquely identifying a particular view
+    Totally ordered with counter most significant field
+    mit is Id of cohort that chose ViewId, to guarantee uniqueness
+  ViewStamp: <ViewId, TimeStamp> pair uniquely identifying an event
+    Totally ordered with ViewId most significant
+    TimeStamp is int consecutively assigned to each event by view's primary
+  Pset: Set of <GroupId, ViewStamp> associated with a particular transaction
+
+Normal case execution of a single atomic operation by module group
+  Client sends request to primary
+    Request includes client chosen unique call-id to make it idempotent
+      Like transaction-id in CHARGE RPC
+    Module state includes client table so can reply to duplicate requests
+  Primary assigns next ViewStamp to call event, sends it to backups
+  Majority of cohorts (sub-majority of backups) acknowledge operation
+    Acknowledgments are cumulative, meaning have <v,ts> if ack <v,ts+1>
+  Primary replies to client
+    Once client hears, majority of cohorts know of transaction
+
+View change protocol
+  Cohort suspects failure/recovery, demands view change
+    Becomes view manager, other cohorts underlings for that view
+  View manager picks new ViewId using cur_viewid.counter+1 and its own mid
+  Broadcast invitation to all other cohorts in group
+  Form new view if majority accept and any of the following 3 holds (p.14):
+    1. Majority of cohorts accept new view and didn't crash
+    2. All crashed nodes have lower viewid than the highest seen
+    3. Some crashed nodes have same viewid, but primary from that view
+       didn't crash and accepted the new view
+    Why #1?
+      If client got ack for call event, majority of cohorts saw it
+      So at least one cohort in new view will know all acked events
+    Why #2?
+      You know a majority of nodes knew all forced operations in last view
+      Problem is some of them might have forgotten because of a crash
+      #2 tells you crashed nodes didn't forget, because they never new
+    Why #3?  Because primary will know of all transactions in view
+  Chose primary for new view as:
+    1. Primary of highest known previous successful view (first choice), or
+    2. Cohort with knowledge of operation with highest known ViewStamp
+  Some nodes may need to download missing operations before joining new view
+  After view formed, force VieStamp <ViewId, 0> so everyone knows formed
+    All cohorts force current view_id to disk
+  If can't form view or get invitation for higher numbered View, give up
+  Why might you be unable to form new view?
+    Too many cohorts already trying to form view with higher ViewId
+    Or had majority but some failed and others onto higher ViewId
+
+Now how do we combine this with 2PC?
+  Operations assigned to ViewStamps will be events
+    Some events are "completed-call for aid, locked these objects"
+    Other events are "committed" or "aborted" transaction aid
+  Keep psets associated with each transaction
+    Tells primaries what to force to backups on prepare
+    If events lost after view change, pset also lets primary ABORT-VOTE
+
+Normal-case transaction processing by a module group
+  Client looks up (primary, ViewId) of target module group
+  Make one or more RPCs to primary, including ViewId
+    Primary rejects if ViewId incorrect (could be old message bouncing around)
+    Otherwise executes call and assigns it a ViewStamp
+    Adds <ViewStamp, obj-list, aid> to tentative history
+    Returns pset including ViewStamp (+ nested calls) with RPC result
+  Client decides to commit, acts as 2PC coordinator
+    Includes merged pset with PREPARE message
+  Primary behavior on receipt of PREPARE
+    - ABORT-VOTE if any unknown ViewStamps for its group in pset
+      Determined by *compatible* predicate (p. 11), as follows:
+        history = highest view stamp seen for each view
+        For each viewstamp in pset that applies to this group:
+           Make sure it is bounded by history--otherwise lost in view change
+      But is this correct? (see *** below)
+    - Otherwise force all events of group in pset to backups before COMMIT-VOTE
+      But note these might already be at backups, so often no work to do!
+  Why might ViewStamp in pset be missing from history?
+    completed-call events are not flushed to backups before replying to client
+    so could be lost in a view change, requiring transaction abort
+  On receipt of COMMIT, primary forces "commit" event to backups before ACK
+  On receipt of ABORT, primary creates "abort" event to record
+  After COMMIT or ABORT, can release locks
+
+
+***
+
+Suppose node A is the primary in view v1, and assigns viewstamp <v1,10>
+to a completed-call event for an RPC to which it has replied.  Now say
+there is a transient network partition that causes a view change at a
+point where only nodes A and B have heard about <v1,10>.  So suppose the
+following series of views form, where * designates the primary in each
+view:
+
+v1: A*, B, C, D, E
+v2: C*, D, E
+v3: C*, B, D, E
+v4: B*, D, E
+
+Now say the coordinator for the transaction that depends on <v1,10>
+finally decides to commit and sends a PREPARE to B while the cohorts are
+active in v4.  The definition of compatible on p. 11 implies that a pset
+containing <v1,10> is compatible with B's history, even though it's not
+compatible with the histories of D and E who have not heard of <v1,10>.
+Of course, B is supposed to flush all events with ViewStamps in the pset
+to the backups.  But B was not the primary for <v1,10>, and did not
+participate in the formation of view v2, so it doesn't really have a way
+to know that D and E don't know about <v1,10>.  <v1,10> wasn't ever in
+B's buffer, so it won't get sent to C and D by forcing B's buffer.
+
+This isn't fatal.  The simplest solution might be to ABORT-VOTE any
+transaction whose pset contains ViewStamps from any earlier views.
+Obviously the authors didn't want to do that.  A slightly milder version
+might be for the primary to abort if the pset contains ViewStamps from
+when it was not the primary (so that if it was primary for several views
+in a row, it can avoid ABORT-VOTEs).
+
+Another solution would be for cohorts to delay updating history until
+they know that a majority of cohorts has heard of an event (but still
+report the latest seen ViewStamp during view changes).  The primary
+could piggyback history updates on other messages when it has
+acknowledgments from a sub-majority of backups.  Such piggybacking of
+sufficiently replicated event Ids is actually a classic technique for
+consensus algorithms.  When using consensus to pick a sequence of inputs
+to a deterministic replicated state machine, cohorts commit (apply)
+operations once they know a majority of cohorts has them and hence that
+the operations won't be rolled back.  Unfortunately, ViewStamped
+replication commingles this low-level "committing" at the consensus
+layer with higher-layer 2PC "committing" of distributed transactions,
+and as a result the protocol doesn't seem to track stable events.
+
+Yet another solution might be that when the primary forces the buffer
+for a PREPARE, it asks backups to check their histories if the
+transaction's pset has older ViewStamps of views where the backups'
+histories could be behind the primary's.  There is no mention of such a
+check in the paper.  Indeed, the primary is supposed to reply
+immediately to a PREPARE if there's nothing in the primary's buffer.
