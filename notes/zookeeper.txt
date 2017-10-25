@@ -1,6 +1,8 @@
 Zookeeper
 =========
 
+KEYWORDS: A-linearizability, atomic broadcast protocol
+
 What problem is this paper trying to solve?
   Coordination in large-scale distributed systems
   Examples: configuration, group membership, leader election, locks
@@ -51,6 +53,10 @@ What operations can we do on znode?
     path is ignored
 What do they mean by asynchronous API?
   Can issue requests and get called back when they complete
+    e.g watch: ZooKeeper uses a watch mechanism to enable clients to cache data
+    without managing the client cache directly. With this mechanism, a client
+    can watch for an update to a given data object, and receive a notification
+    upon an update.
   A common alternative to threads for issuing concurrent requests
 
 What's a zookeeper session?
@@ -98,7 +104,7 @@ What's an atomic broadcast protocol?
       1. All servers agree on system's initial state (hard-coded)
       2. All servers agree on each deterministic update before applying it
 
-What are leases?
+What are leases? (Used by Chubby)
   A time-limited promise by system to notify you before changing some state
   E.g., primary lease means primary knows it is still primary for 30 seconds
   Paper knocks Chubby for using client leases--why are these bad?
@@ -108,7 +114,7 @@ What are leases?
   Why doesn't zookeeper need client leases?
     Zookeeper delivers watch notifications *after* changes happen
   But note session timeout mechanism can effectively be used for leases
-    Need ephemeral lock node to disapper after client failure?
+    Need ephemeral lock node to disappear after client failure?
     Waiting for client session to time out
 
 Example: Ready znode
@@ -120,11 +126,14 @@ Example: Ready znode
     FIFO ordering guarantees delivery of watch from ready before config data
       So client knows to ignore the results of config1, config2
       Just calls exists(ready, true) and restarts read when ready exists
+  Steps above ensure that if process sees znode, it must also see all the config
+  changes made by the new leader. Consistency guarantee.
 
 Example: Simple lock
-  Create ephemeral lock vnode--if succeeds, you have the lock
+  Create ephemeral lock znode/"file"--if succeeds, you have the lock
     If fails, call getData(lock, true), notified when deleted
-    If client session fails, lock automatically released
+    If client session fails, lock automatically released. Otherwise client
+    explicitly deletes this znode.
   What's wrong?  Herd effect
     All clients woken up when lock released, but only one can get lock
 
@@ -144,7 +153,15 @@ How to do Read/write lock?
   Encode read/write intent in znode name ("lock/read-SEQ" or "lock/write-SEQ")
 
 Double barrier?
+  Double barriers enable clients to synchronize the beginning and the end of a
+  computation. When enough processes, defined by the barrier threshold, have
+  joined the barrier, processes start their computation and leave the barrier
+  once they have finished.
+
   Use ready node trick, and create when you are nth to join
+
+Idempotent: Applied multiple times without changing the result beyond the
+initial application
 
 Are zookeeper's API functions idempotent?
   Definitely not.  E.g., sequential znode create bumps counter

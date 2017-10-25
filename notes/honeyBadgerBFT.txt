@@ -1,17 +1,25 @@
 Honey Badger
 ============
 
+KEYWORDS: RBC, ABA, ACS
+
+HOMEWORK QUESTION: In Figure 1 of the paper, step 1 has each node encrypt its proposed value, while step 3 decrypts. Would would go wrong if, instead, the protocol did away with encryption and ran ACS directly on each individual node's proposed value? Why?
+
+ANSWER: Delay packet to ensure RBC (and final commit value outcome) excludes that packet.
+
 Recall FLP (1983):
     No deterministic consensus protocol can achieve all three of
     safety, liveness, and fault-tolerance in an asynchronous system.
 
 So far, we have mostly discussed sacrificing liveness
   Idea: guarantee safety and fault tolerance, terminate in practice
-  Protocol must not get stuck, so always maintain hope of terminating
+  Among all protocols, the protocol must not get stuck, and always maintain
+  hope of terminating
 
 Another possibility: attack asynchronous system assumption
   Suppose all nodes can always communicate within T seconds by everyone's clock
   (So can communicate within T-epsilon real seconds to account for skew)
+
 Famous Byzantine generals protocol (Lamport,Shostak,Pease) signed variant:
 * Problem statement:
     General G_0 (possibly a traitor) broadcasts an order (attack or retreat)
@@ -31,6 +39,8 @@ Famous Byzantine generals protocol (Lamport,Shostak,Pease) signed variant:
            then G_i adds its own signature to message (now has r+1 nested sigs)
                 broadcasts message to generals that haven't signed yet
         Reject messages with fewer than r distinct signatures in round r
+        CHAIN OF TRUST--if G_0 already in chain, addition of impostor G_0
+        indicates one general is lying and masquerading as another!
     After round f, will have 0 or more messages each containing some order v
       General G_i knows that for each of these messages, either:
         - G_i broadcast the message to all generals that hadn't seen it, or
@@ -63,6 +73,9 @@ What if we play with "deterministic" instead of "asynchronous" in FLP?
   Can we instead make probability dependent on nodes' random choices?
 
 In response to FLP, Ben Or proposed the following protocol in 1983:
+  --> "What if protocol is not deterministic?"
+  The algorithm Ben Or proposed: Asynchronous Binary Agreement Protocol
+    Binary because you're just trying to agree on one bit among nodes
   Goal: consensus on one bit (a.k.a. asynchronous binary agreement, or ABA)
   Assumes at most f faulty nodes out of N>5f (sic, not N>3f) nodes
 
@@ -102,23 +115,27 @@ Analysis:
 So why not use Ben Or instead of PBFT?
   Only agrees on one bit, not arbitrary operation
   Exponential expected number of rounds required when flipping coins
+  Everyone has their own coin to flip and broadcast results of
 
 Rabin's idea (1983): What if everyone flipped the same *common coin*?
   Can use a deterministic threshold digital signature scheme
     E.g., threshold RSA with full-domain-hash
+  Secret sharing:
   Sign message "(consensus instance, round number)"
     Take low bit of SHA256(signature) as common coin value
   Attacker doesn't learn coin until too late to send COMMITs
   Rabin's trick:  Randomize vote threshold between N/2 and (N-2f)
     Bad network can't split over threshold if it can't predict threshold
     But all nodes can use the same threshold based on common coin
-  But see MostÃ©faoui [43] for a much better protocol using this idea
+  But see Mostafaoui [43] for a much better protocol using this idea
+    Impl of async consensus
   Caveat: common coin requires trusted dealer or fancy crypto
     Somehow need to get nodes shares of the same private key
     (Or in Rabin's case direct shares of a sequence of one-shot random bits)
 
-What is asynchronous Reliable Broadcast?
+What is asynchronous Reliable Broadcast (RBC)?
   Set of nodes {P_i} including distinguish sender P_S that has input h
+    PS sends to P_0, P_1, P_2 for example.
   If P_S is non-faulty, all non-faulty nodes deliver h
     else, either all non-faulty nodes deliver same h', or none terminate
   Boils down to:
@@ -130,7 +147,14 @@ How would you do simple (Bracha-style) RBC w/o erasure coding, N > 3f?
   P_i receives VAL(h), broadcast ECHO(h)
   P_i receives N-f ECHO(h) messages, broadcasts READY(h)
   P_i receives f+1 READY(h), broadcasts READY(h) [if hasn't already]
+    You know at least one of those f+1 are honest.
+    You know h really is the value stated, so you can broadcast your val of h
+    knowing you won't violate the invariant that all honest nodes broadcasting
+    READY(h) broadcast the same value of h.
   P_i receives 2f+1 READY(h), delivers h
+    f may be lying or about to fail, but the other f+1 will be up and ready to
+    broadcast h, therefore you everyone will hear READY(h) from f+1 nodes, so
+    eventually all non-faulty nodes will broadcast READY(h) assuming N = 3f+1
 Why does this work?
   N-f nodes includes majority of non-faulty nodes
     So READY from all non-faulty nodes will have same value h => agreement
@@ -143,9 +167,19 @@ How does erasure coding improve efficiency?
   What if h is big?  P_S will have to send many copies
     Instead, make h a cryptographic hash
     But use merkle tree so can individually verify any block of message from h
-  Erasure coding: make n>k shares of k-block msg, so any k reconstruct msg
+  Merkle tree:
+    - use digest function to take large msg and hash it to value, used to
+    verify msg
+    - Get hashes for two blocks 00 and 01. Concatenate hashes of 00 and 01
+    and re-hash this concatenated string to get 0. Continue hashing child nodes
+    like this to get a root node whose hash can be used to verify the contents
+    of a collection of packets.
+  Erasure coding: make n>k shares of k-block msg, so any k can be used to
+  reconstruct msg
   Change protocol to broadcast VAL(h,b_i,s_i), ECHO(h,b_i,s_i)
-    s_i is share of message, b_i is proof that it is in hash tree with root h
+    s_i is share of message (leaf node of merkle tree)
+    b_i is proof that it is in hash tree with root h (hashes at parent blocks,
+    go all the way up to root to verify!)
   Wait for N-f ECHO messages (guaranteed to get if 2f+1 READY(h)), reconstruct
 
 Why doesn't RBC give us consensus with following straw man?
@@ -156,6 +190,9 @@ Red flag: can't be right, would violate FLP (not randomized)
 Problem: guaranteed to converge, but nodes don't know when
   Might not get RBC from faulty senders, but don't know which are faulty
   A node risks outputting median value before hearing all inputs
+
+RBC argued to use too much bandwidth, so ACS used to increase bandwidth
+efficiency.
 
 What is asynchronous common subset (ACS)?
   Each node P_i has input v_i, must output some set of values
@@ -169,10 +206,12 @@ How to build ACS from RBC and ABA?
   Start out like straw-man above: each P_i RBCs v_i (N instances of RBC)
   But now use N instances of ABA to pick at least N-f of these RBCs:
 
+    // while loop waits for reliable broadcasts to complete
     while (fewer than N-f RBCs have delivered a value
            && fewer than N-f ABA instances have output 1) {
       if (RBC_j delivers v_j)
-        Supply 1 as input to ABA_j
+        Supply 1 as input to ABA_j // use ABA_j to decide if to include subset
+                                   // "I would like to include this input!"
     }
     Supply 0 as input to any remaining ABAs we haven't started yet
     Output { v_j | ABA_j output 1 }  [waiting for RBCs if necessary]
@@ -190,6 +229,8 @@ How to enhance throughput?
 How does this enable censorship w/o threshold encryption?
   Say attacker controls network and f nodes
   Ensure whatever node RBCs victim transaction is always slow
+  Ensure RBC will complete without node (make it so slow the loop completes
+  without, at least in that Honey Badger round)
   Allows attacker to keep some transaction from ever being included
 How does threshold encryption solve?
   Attacker doesn't know who has RBCed what transactions until it is too late
@@ -200,4 +241,5 @@ Would you use HoneyBadgerBFT for a network file system like BFS?
 
 Why use HoneyBadgerBFT instead of PBFT?
   High throughput with many replicas, big batch sizes
+    Nodes geographically far apart, so PBFT timeouts would not be useful
   No need to worry about tuning timeouts

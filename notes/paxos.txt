@@ -1,6 +1,16 @@
 Paxos
 =====
 
+KEYWORDS: Irrefutable, Neutralizable statements;
+
+HOMEWORK QUESTION:
+Suppose you have a replicated state machine running on three servers, using the optimized Paxos algorithm described in the paper. During normal-case operation (no failures or network timeouts), how many network messages must be exchanged between the three replicas for each new command applied to the replicated state machine? Explain what these are.
+
+If it is helpful, you may assume that messages can contain multiple piggybacked requests. But do not assume that the replicas know about more than one state machine command at a time. That would render the question meaningless by allowing replicas to combine multiple commands into a giant compound command that potentially executes arbitrarily many commands in a fixed number of network messages.
+
+ANSWER:
+4. Leader gets lease so it does not need to send prepare messages. So all it has to do is send two commits and receive two ACKs.
+
 State machine replication review
   Boils down to a consensus problem for each slot in an operation log
 
@@ -146,7 +156,8 @@ The complication:  An indeterminate ballot didn't necessarily fail
 
 Solution:  Conservatively assume indeterminate ballots may have succeeded
   Note, if v' = v above, there is no problem
-  So if ballot b indeterminate, ensure all future ballots use same value
+  So if ballot b indeterminate, ensure all future ballots use same value to
+  tie-break
 
 The (single-decree) Paxos protocol:
 * Paxos is all about making sure all successful votes and stuck votes are for

@@ -1,6 +1,15 @@
 Viewstamped Replication
 =======================
 
+KEYWORDS: Viewstamp, 2PC, 3PC, pset
+
+HOMEWORK QUESTION:
+Imagine a very simple VR system with a single group, in which objects are just integers with atomic increment and decrement operations. In normal case operation (no view changes), how many synchronous disk writes are required by the primary to execute and commit a simple transaction incrementing one integer? How many writes are required by the backups?
+
+ANSWER:
+0 and 0. Primary forces buffer with txn records to backups. Backups can do
+async disk writes?
+
 Clarification on serializability (I was unclear Monday)
   Two-phase locking is acquiring all locks before releasing any
   Two-phase locking guarantees serializability even in distributed system

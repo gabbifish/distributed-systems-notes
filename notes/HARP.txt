@@ -1,6 +1,13 @@
 Harp
 ====
 
+KEYWORDS: NFS, VFS, witness, event record
+
+HOMEWORK QUESTION:
+How many servers does Harp require to survive two complete machine failures (not just crashes) without any data loss? How many copies of the file system must there be? Explain briefly.
+
+ANSWER: Harp also requires n+1 data replications to survive n server failures, meaning 3 file system copies across the primary and two backup servers are needed to survive 2 server failures.
+
 What are the goals of this work?
   Replicated network file system server with high
      Durability, Availability, Performance

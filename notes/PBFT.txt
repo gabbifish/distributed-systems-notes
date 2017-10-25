@@ -1,6 +1,13 @@
 Practical Byzantine Fault Tolerance
 ===================================
 
+KEYWORDS: Quorum, checkpoints, BFS
+
+HOMEWORK QUESTION: How does PBFT prevent a faulty primary file server replica from choosing a wildly incorrect file modification time (e.g., 10 years in the future)?
+
+ANSWER: Primary selects time value, piggybacks on PRE-PREPARE
+  "replicas must be able to decide deterministically whether... correct"
+
 Suppose you have N replicas, f of which might crash (non-Byzantine failure)
 What quorum size Q do you need to guarantee liveness and safety?
   * Liveness: (or pseudo-liveness, i.e., avoiding stuck states)
@@ -237,6 +244,8 @@ How are read-only (RO) requests optimized?
     Saved by the fact that only one op can prepare for a single view/seq#
 
 BFS-nr: Quorum size of 1. This tells you pure overhead costs for replication
+  Add your estimates to number here as baseline. Helps with apples-to-apples
+  comparison between overhead costs for BFS-nr.
 
 What about compromised clients?  (p. 2)
   Results of faulty client operations must be consistent

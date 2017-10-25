@@ -1,6 +1,13 @@
 A New Presumed Commit Optimization for Two Phase Commit
 =======================================================
 
+KEYWORDS: PrN, NPrC, PrA, PrC
+
+HOMEWORK QUESTION:
+In Table 1, the rows for PrN and PrA show identical counts of log writes, forced log writes, and messages in the case of a normal (read-write) transaction. What exactly is PrA optimizing if it doesn't show up in the table?
+
+ANSWER: PrN will force the transaction outcome on its log for both COMMIT or ABORT outcomes to ensure that an outcome message is retrievable in case of transaction manager failure; PrA simply deletes the entry after it has sent an ABORT outcome and does not wait for an ACK. If, for PrA, an entry does not show up in the log write table, the cohorts can assume that transactions not included in the table were aborted.  This reduces the amount of logs that must be written and saved for each transaction.
+
 Say you want to move $100 from account A to account B at a bank
   Such a transaction could fail depending on state of ledger
   E.g., Account A has insufficient funds, or either account deleted
@@ -120,6 +127,7 @@ What's the read-only optimization?
   Transaction might be read-only at one cohort
     Only effect is to hold locks for duration of transaction
     So cohort doesn't care whether transaction commits or aborts
+    Cohort just wants to know when txn is done so it can release locks
   Cohort replies to PREPARE with READ-ONLY-VOTE
     Also releases all locks when it sends READ-ONLY-VOTE
       any locked data unmodified since transaction read-only at cohort
