@@ -1,0 +1,247 @@
+No compromises (FaRM)
+=====================
+
+TAGS: DRAM, RDMA, cache/log lines, reconfiguration
+
+QUESTION: Suppose that FaRM reversed the LOCK and VALIDATE phases in Figure 4,
+so that VALIDATE came before LOCK. What problem would this cause?
+
+ANSWER: If VALIDATE comes before LOCK, this sequence will not provide safety in
+the event of a crash following the LOCK in a transaction. When a LOCK is
+recovered, the transaction will assume that all read-only objects have been
+validated and continue onto the COMMIT backups and COMMIT primaries steps of
+the transaction. If the read-only objects were modified between the crash and
+LOCK recovery, this means that the recovered transaction is now continuing with
+unvalidated and possibly changed read-only objects.
+
+[Note: some details filled in from previous NSDI'14 FaRM paper]
+
+What is non-volatile DRAM (Dynamic Random Memory Access)?
+  Provides durable memory without cost of synchronous disk/SSD writes
+  Key idea: use a "distributed UPS"
+    Remember, UPS = uninterruptible power supply
+    Leverage existing cloud hardware specs, e.g., Open CloudServer (OCS)
+    12U chassis holds 24 machines with shared power supplies
+    So put Li-ion batteries + SSD in each chassis, dump memory on power outage
+    Plausible argument this is cost effective (adds 15% over base DRAM cost)
+  Why aren't traditional data-center UPSes adequate for the task?
+    Giant centralized lead-acid batteries used while switching to aux generators
+    But single rack or machine can still lose power if wrong cable yanked
+    (Power failure notification might not get through)
+
+What is RDMA (Remote Direct Memory Access)?
+  NIC support for access to memory on another machine
+    Request does not need to go through kernel on client machine
+    Request does not need to go through CPU at all on server machine!
+  Uses reliable connections called *queue pairs* between machines
+  Regions must be registered on the host offering remote access
+    Pins memory; NIC maintains page-table like structures
+    Limited on-NIC memory to cache page mappings, else fetch with DMA
+      Using 2GB pages helps fit all mappings in cache
+    Each region named by a *region capability*
+  Also on platform used by authors:
+    DMA operations are cache coherent
+    Multi-cache-line RDMA writes (but not reads) go in address order
+  Note "one-sided RDMA operation" means CPU used at only one side
+    Still have round-trip at network level to return write ack or read data
+
+Let's build fast messaging on RDMA + circular buffers:
+  Allocate a circular buffer on the receiver, zero out all memory
+  Sender & receiver each maintain head pointers, sender has tail pointer
+  1. Sender ensures message would not wrap past head (otherwise wait)
+  2. Sender writes {Length || Message || Trailer} at tail
+  3. Receiver polls at head until Length is non-zero
+  4. Receiver polls on head+Length until Trailer is non-zero
+  5. Receiver processes message, then zeros out memory
+  6. Half way through buffer receiver uses RDMA to updates head at sender
+Can use for really fast RPC--why not just use RPC for remote objects?
+  Steps 5 consumes CPU on server; CPU becomes the bottleneck
+
+R/W Example: Take two machines A, B:
+- B has receiver head, sender head, tail
+- When A sends message, it writes to B at memory pointed to by tail
+- Written memory to tail is { length || msg || trailer }
+- Tail moves to memory space after last written space.
+- Reader can pull and constantly look at head.
+    When reader notices nonzero byte at receive head, it knows message is
+    complete and can read whole entry.
+- Sometimes receiver will move location of sender head
+    What's IMPORTANT is that the tail of written entries never goes past
+    sender head (or else unintentional overwrites occur!)
+
+What is the FaRM system API?
+  ACID transactions on objects in shared global address space
+    Begin, Commit, Alloc, Free, Read, Write
+    But: be careful of external side effects in case Commit fails
+      Consistency checks deferred until Commit
+  Lock-free reads - single-object read-only transactions
+  Some kind of function shipping (alluded to in Sec 6.2, p. 64)
+    E.g., run ++x on server storing x, avoiding lock + 2 RDMAs (read, write)
+      1. begin txn (lock)
+      2. read x
+      3. write x.
+
+What is the system architecture?
+  Machines connected by Infiniband (or RoCE) network supporting RDMA
+  Set of machines S, each of which is both a storage and compute server
+    Each has a bunch of 2GB RDMA regions, and also runs FaRM computations
+    Why this symmetric design instead of separate storage/compute nodes?
+      Because RDMA uses less CPU, so make use of available CPU
+      Plus can sometimes leverage locality to operate on local data
+  One dedicated configuration manager machine CM in S
+    Assigns each region on one primary and f backup servers in S
+      (mapping is stored in the regions themselves, too)
+    CM exchanges leases with all other servers to detect failure
+  A zookeeper instance in which CM stores a configuration <c, S, F, CM>
+    c = view number, F = mapping from S to failure domains
+
+Take two machines A, B:
+1. Simulateously:
+    a. A performs RDMA read of region in machine B
+    b. B's CPU writes to same region
+2. A might read mismash of old and new version of B's region!
+
+^ What happens to RDMA read while CPU simultaneously writing to object?
+  RDMA might return a mishmash of old and new cache lines.  What to do?
+  Idea 1: Put a 63-bit counter + 1 bit lock in header of each
+    { ctr | lock | object }
+    Read counter, read object, read counter again
+    Repeat previous step if locked or two counter values read not equal
+    Works, but requires 3 RDMA reads for each object read
+    Lock alone does not work--first read could be before txn and second read
+    after, so value changed! Must check counter to verify.
+  Idea 2: Put counter in each cache line of object
+    { ctr | line }
+    { ctr | line }
+    { ctr | line }...
+    Repeat RDMA read if all counters not equal
+    Works, but eats 8 bytes out of each 64-bit cache line (12.5% mem waste)
+  Idea 3: Put counter in object header, low 16 bits in each cache line
+    { ctr | lock | data }
+    { low 16 bits of ctr | data }
+    { low 16 bits of ctr | data }...
+    Almost works unless unlucky and low 16 bits of counter wrap
+  Idea 4: Like 3, but repeat if RDMA read takes more than 2ms
+    Reasonable to bound RDMA time because network so fast
+    Chose small time such that 65,536 lock/unlock cycles not practical
+
+How does a normal-case (no failure) transaction proceed? (Fig. 4)
+  Read a bunch of objects using RDMA
+  Buffer all writes on the coordinator (expose no writes before commit)
+  Engage in four-phase commit protocol:
+    1. Lock: Send a LOCK RPC to primary of each written region
+       Contains new object data + info on other objects/regions in transaction
+       Uses CPU on primary to lock specific version with compare-and-swap
+       If lock fails, must abort transaction
+    2. RDMA-read versions of all read-only objects and validate that unchanged
+       (Abort if any version number changed--may have inconsistent reads)
+    3. RDMA-write COMMIT-BACKUP w. new data to backup(s) of each written object
+    4. RDMA-write COMMIT-PRIMARY to each primary to which LOCK previously sent
+        No objects actually written, just knowledge that COMMIT-BACKUP worked!
+    5  RDMA-write TRUNCATE to primary and backups
+  Note: 2-4 don't use server CPU; complete with network-level RDMA response
+        5 is lazy, can be piggybacked on other messages
+
+What is the serialization point of a read-write transaction?
+  Point where all locks acquired
+  If two transactions simultaneously have all their locks, don't conflict
+What is the serialization point of a read-only transaction?
+  Point of last read
+  Since all read versions subsequently validated not to have changed
+What if coordinator wrote COMMIT-BACKUP & COMMIT-PRIMARY in parallel?
+  Expose uncommitted data if primary+coordinator fail, backup didn't receive
+When can a coordinator externalize the effects of a transaction?
+  After successfully logging COMMIT-PRIMARY for *one* object
+  Because coordinator might fail, and only coordinator knows read set
+    Must abort transaction if coordinator doesn't say read-set okay
+    But if primary + f backups committed, at most f fail, so know validated
+
+How is failure detection fast?  5msec lease time.  How to avoid false timeouts?
+  Use dedicated queue pair for lease messages (not queued behind other work)
+  Use *unreliable* transport, because this is connectionless
+    CM uses single queue for all lease messages (think 1 UDP socket vs. N TCP)
+    Otherwise would overflow queue pair cache
+  Use dedicated highest-priority thread to process leases
+    Preallocate and pin all memory (including code) of lease thread
+    *Don't* pin the lease thread to a core in case system usurps the core
+    Instead, leave two hyperthreads without pinned FaRM threads
+    So usually leases processed on unassigned hyperthreads
+    But worse case lease thread can preempt another lower-priority FaRM thread
+
+If a lease expires, does a server just stop serving stale objects?
+  Only for external requests (from clients outside of S)
+  FaRM servers read data with RDMA--can't check lease validity if CPU not used
+  What's the solution?  Strict membership
+    All machines (not majority) must acknowledge new configuration
+    No mutation until all machines in acknowledge new config
+    Coordinators don't RDMA to or accept replies from non-members
+
+What are reconfiguration steps?  (Fig. 5)
+  1. Suspect:  CM cuts off external client requests
+  2. Probe:  [new] CM checks all other machines (in case correlated failure)
+     Stop if can't probe a majority of machines (wait for network to come back)
+     Probe reply includes "LastDrained" value (p. 61)
+      ^ Last log entry applied in regions.
+  3. Update config:  write <c+1,S,F,CM'> in zookeeper
+  4. Remap regions: make sure f+1 replicas exist for all regions
+  5. CM sends NEW-CONFIG to all servers (resets lease protocol if CM changed)
+     For each region r that changed in new configuration, CM also includes:
+         LastPrimaryChange[r] and LastReplicaChange[r]
+  6. Servers block external requests, ack NEW-CONFIG (piggybacking lease msgs)
+  7. After all NEW-CONFIG-ACK received *and* all old leases expired, new CM
+     broadcasts NEW-CONFIG-COMMIT, all unblock and can process requests again
+  Note 5-7 basically like 2PC plus waiting for old leases to expire
+
+Paper defines *recovering transaction* (p. 61) as "one whose commit
+  phase spans configuration changes, and for which some replica of a
+  written object, some primary of a read object, or the coordinator
+  has changed due to reconfiguration."
+
+How does FaRM deal with recovering transactions?  (Fig. 6)
+  1. Block access to recovering regions if new primary
+  2. Drain logs since CPU cannot reject writes that were acked at RDMA level
+     So must apply all log entries present when NEW-CONFIG-COMMIT received
+     Set LastDrained = unique id <c,m,t,l> of last transaction drained
+       c = viewno, m = coordinator, t thread on m, l thread-local ctr
+  3. Find recovering transactions = those started committing in c-1, unless:
+     - LastReplicaChange[r] < c for all written regions r, and
+     - LastPrimaryChange[r] < c for all read-only regions r, and
+     - the coordinator has not been removed
+     Backups must notify primaries of all regions needing recovery
+  4. Lock recovery - fetch missing log records to restore all lock state
+     At this point region is active again, can start accepting RDMA
+  5. Replicate log records (on backups that might be missing them)
+  6. Coordinator receives votes on what to do with each recovering transaction
+     (If coordinator failed, new one picked by consistent hashing)
+     Each region's primary automatically sends one of 4 votes
+       - commit-primary: If any replica in region saw COMMIT-PRIMARY, else
+       - commit-backup: If any replica in region saw COMMIT-BACKUP, else
+       - lock: If any replica in region saw LOCK, else
+       - abort: If none of the above apply
+     If coordinator doesn't get vote for region in 250usec, requests it
+     Primary that hasn't heard of transaction can vote:
+       - truncated: if transaction must be truncated from log
+       - unknown: if transaction unknown
+       How does it know if truncated or not?  Basically uses NPrC trick:
+         Remember committed, but set is kept compact with lower bound (p. 62)
+  7. Decide to commit iff:
+     - Any primary votes commit-primary, or
+     - Any primary votes commit-backup *and* no votes for abort or unknown
+     Broadcast COMMIT-RECOVERY or ABORT-RECOVERY to notify participants
+     Once all ack, send TRUNCATE-RECOVERY
+
+How does recovery impact throughput?
+  Pause for 10s of milliseconds not so bad
+  Pacing of re-replication in background only minimally impacts throughput
+
+How does performance compare to Dynamo?
+  Numbers in Dynamo paper use milliseconds.  Here we see microseconds!
+    But would be nice to see 99.9th percentile, not 99th
+  Does FaRM's strict serializability make failure recovery too expensive?
+    Actually 10s of ms probably in the noise for Dynamo
+  Should Amazon ditch Dynamo for FaRM?  unclear
+    FaRM paper doesn't have much evaluation of scalability
+      Some vague talk of hierarchical leases, not implemented
+    Requires more expensive hardware
+    Violates Amazon's service oriented architecture
+      Linking with FaRM C++ lib makes it harder to enforce SLA, blame crashes

@@ -1,0 +1,222 @@
+Dynamo: Amazon's Highly Available Key-value Store
+=================================================
+
+TAGS: Merkle Tree, quorum system, conistent hashing (or lack thereof?),
+
+QUESTION: Describe a simple scenario in which a get() operation could return
+more than one value for a single key.
+
+ANSWER:Servers partitioned, multiple coordinators;Concurrent client updates
+
+Dynamo is a simple key-value store, used in a production environment
+  Amazon's applications do not need the full power of SQL queries
+  But all else equal, traditional consistency would be fine...
+What are traditional "ACID" database semantics (Â§2.1)?
+    Atomicity - All or none of actions happen
+    Consistency - Transaction leaves data in valid state (all invariants hold)
+    Isolation - All actions in a transaction appear to happen before
+                or after other transactions
+    Durability - Effects of transactions will survive reboots
+Why doesn't Amazon want to pursue traditional ACID semantics?
+  Problem:  Consistency vs. availability and response time (Â§2.3)
+  In many scenarios, actually better to get wrong answer than no/slow answer
+  Exacerbating problem is focus on 99.9% latency--why?
+    Exceeding latency costs Amazon serious money (blocks purchase)
+    A single end-user operation may require many Dynamo operations
+      Any one of them could blow the whole operation and lose a customer
+      Strict SLAs ensure such failures will be kept to a minimum
+
+What does Dynamo API look like (Â§4.1)?
+  get (key)                 -> (context, list of values)
+  put (key, context, value) -> void
+  What is this weird context value from the client's point of view
+    Just an opaque string of bytes needing to be sent back in a put
+    But idea is to help server resolve conflicts (more on this later)
+
+What are issues in deciding how to spread keys amongst the servers?
+  Replicate values on at least N machines (in case of failure)
+  Handle heterogeneous nodes (new machines more powerful than old)
+  Minimize churn when machines are added or removed
+
+Does dynamo place data using consistent hashing?  Not really.
+  Why is consistent hashing not great for Dynamo?
+    Partitions determined when nodes join and leave system
+      So nodes must scan their data to re-partition and transfer state
+    Makes reconciliation harder (must recompute Merkle trees)
+    Makes snapshots harder
+    Also need to know all the tokens for other nodes; needs more metadata
+  What does Dynamo actually do instead of consistent hashing (Â§6.2)?
+    Split ring into fixed, equal size arcs/segments (Figure 7 strategy 3)
+    Use many more segments than there are nodes
+    Divide these segments up amongst nodes (each segment replicated N times)
+    This is a good technique to know about (# partitions >> # servers)!
+  Note consistent hashing / DHTs were a hot topic in 2007
+    Probably why authors tried it first, even though simpler technique better
+    Maybe this wasn't the best way to write the paper, though
+
+Explain Figure 8 (p. 217)?  (#1 is consistent hashing, #3 fixed buckets)
+  S nodes in system, T tokens per node in #1, Q keyspace partitions in #3
+  First, what is state that must be stored (for 1-hop lookups)?
+    #1: Need S*T token -> node mappings (every token of every node)
+    #3: Need to store Q token (partition) -> node mappings
+  For same fairness, #1 uses "3 orders of magnitude" more state than #3.  Why?
+    In #3, the tokens are spaced perfectly evenly, will even out load
+    Tokens might also be smaller (make least significant bits all 0, truncate)
+    More points around circle to hash to, more circle is divided (and more
+    locations for new value... and more nodes to contact)
+  Any disadvantages to #3?
+    "changing the node membership requires coordination" (p. 217)
+
+How does Dynamo achieve geographic replication?
+  Â§4.6: "In essence, the preference list of a key is constructed such
+         that the storage nodes are spread across multiple data centers."
+  Maybe they ensure this while doing partition assignment to servers?
+    Reserve even partitions for one data center, odd partitions for another?
+  Might be clearer if paper not written in terms of consistent hashing
+
+In strategy 3, Merkle tree does not need to be recomputed vs. strategy 1
+because hashes are already precomputed for each sector in 2 and 3 (but not 1!)
+
+What is a "quorum technique"?
+  Say you store a value on N servers and care about linearizability...
+  Write must reach some write-set of W servers before deemed complete
+  Read must hear from some read-set of R servers before being deemed complete
+  If every write-set and read-set have a non-empty intersection:
+    Guarantees a reader will see effects of a previously completed write
+  An easy way to guarantee this is to ensure R + W > N
+    Convince everyone this works even with failure within fixed N nodes
+  In Dynamo Dynamo instance configured with its own N, R, W
+
+In general, quorums useful with many independently accessed objects
+  Unlike, e.g., Raft, no need for nodes to agree on complete state of system
+    linearizability still possible, because local property of each object
+  But to ensure object linearizability, must worry about conflicts
+    E.g., imagine 3 nodes, A, B, C storing replicated register with R=W=2
+      Client 1 writes x to A; simultaneously client 2 writes y to B; C fails
+      Now you can't read V, because no majority
+  Solution?  Assign version numbers to values (a bit like Paxos ballots)
+    Put client ID in version numbers to make them unique
+    To write:
+      - Ask max(W,(N+1)/2) replicas for current version number
+      - Pick new version number greater than any previous version
+      - Send new version to all replicas
+      - Replicas accept only if new version number higher than previous
+      - Write completes at client only if/when W replicas acknowledge success
+    To read:
+      - Ask all replicas for current (value, version) pair
+      - Receive R matching replies?  Done
+      - Otherwise, clean up the mess:  Re-broadcast most recent
+        (value, version) to finish write started by failed/slow client.
+
+Digression: Can a quorum system survive f Byzantine failures? [Malkhi]
+  To write:
+    - Wait for R version numbers, pick one greater than all seen/sent
+    - Broadcast write, wait for W acknowledgments
+  To read:
+    - Wait for R read replies <v_i, s_i> *such that f+1 matching <v,s> pairs*
+      (otherwise, if only f, could all be lies)
+    - If multiple f+1 matching replies, take one with highest version number
+    - What if don't get f+1 matching reads?
+      Might have concurrent writes, so just ask again
+  How many servers do you need for f failures?
+    - Safety:  R + W - N >= 2f + 1 (R + W - N = minimum overlap of write quorum)
+      When read follows write, minimum overlap of two quorums is R + W - N
+      That overlap must contain at least f+1 honest nodes for read to succeed
+    - Liveness:  R <= N - f  (a read quorum must exist)
+    - Also:  W <= N (otherwise doesn't make any sense)
+  Note this works if N == 4f+1 and R == W == 3f+1
+    Safety: (3f+1) + (3f+1) - (4f+1) = 2f+1
+    Liveness: 2f+1 <= 4f+1 - f
+
+What happens when Dynamo client issues a request (Â§4.5)?
+  A key's N successors around Chord ring are its *preference list* (Â§4.3)
+  Option 1:  Send to generic load balancer, which sends to Dynamo server
+  Option 2:  Clients have server map and know where to send (Â§6.4)
+    Clients poll random server every 10 seconds for membership change
+  Then:
+    If not in preference list, forward to (ideally first) in pref list
+      Will usually only be necessary for Option 1 above
+      Forwarding is required for writes, optional for reads
+        (Why required for writes?  To keep vector timestamps small)
+    Wait for W or R servers (depending on op), then reply
+    Keep waiting for stragglers to update them and simplify anti-entropy (Â§5)
+
+What happens when a server is down or partitioned (Â§4.6)?
+  Hinted handoff:  Write values to next server around ring
+    E.g., in Fig. 2 N=3, if B down, store node K on E
+    But tell E that the write was really intended for B
+  Server (E) stores hinted values in separate file,
+    Makes it easy to transfer whole file to target (B) when back up
+    (Note with partitioning scheme #3 the separate file thing automatic)
+  What does this do to our quorum algorithm?!!
+    Basically breaks it--they call this a "Sloppy quorum"
+    But fits with philosophy of prioritizing availability over correctness
+
+What happens if server is permanently down?
+  Administrator must manually decide this and configure system
+  Fortunately, new writes have been going to the right place
+    But may now have old values replicated at only N-1 servers
+  Administrator may also add new node(s) to replace old
+After add/remove/failure--how to ensure state properly replicated
+  Transfer needed ring arcs from other servers
+  Confirmation round (Â§4.9) ensures you don't get something you don't need
+In many cases, don't need to transfer a whole arc
+  Just want to fix up a few missing entries
+  Merkle trees make it easy to compare state when only small parts are missing
+
+How does every node know the composition of the whole Chord ring?
+  Only human administrator can change ring membership
+  Gossip protocol (Â§4.8) - every sec exchange membership info with random peer
+When adding servers, what's a seed?  (Â§4.8.2)
+  Server known to all--want to make sure you don't get divergent parallel rings
+
+Is Dynamo Linearizable?  No.  API even exposes conflicts
+What can lead to an update conflict?
+  Servers partitioned, multiple coordinators
+  Concurrent client updates
+    Unlike usual quorum system, write coordinator doesn't read versions
+    Client does because of "context," but can have concurrent clients
+How are such conflicts resolved?
+  Servers may resolve "syntactically" using vector clocks.  Review:
+    List of serverId-versioNo pairs.  E.g., <A-1, B-2> (assume 0 for others)
+    Each server bumps it version number when making an update
+    Partial order: vector clock V1 <= V2 if forall s V1[s] <= V2[s]
+    If V1 <= V2, replace version V1 with V2 (cf. git fast-forward merge)
+    If V1 </= V2 and V2 </= V1, have update conflict
+  How does Dynamo handle update conflicts - resolve "semantically"?
+    Option 1: expose to user (that's why get returns multiple values)
+      Requires application willing to resolve conflicts
+    Option 2: just pick one (last writer wins, discards updates)
+  Note Dynamo truncates vector clocks at 10 newest entries
+
+No global failure state (Â§4.8.3)--why?
+  Node join and leave operations are explicitly triggered by administrator
+  While node is unavailable, other nodes can just detect this for themselves
+  Much simpler
+
+How do durability compromises work to decrease latency (Â§6.1)?
+  Nodes use background thread to write--reply before data stably on disk
+  Coordinator asks one out of N nodes to write synchronously
+  But usually W < N, so data won't be on disk before replying to client
+
+What are background tasks (Â§6.5)?
+  Replica synchronization and data handoff (from hinting or node churn)
+  Use feedback-based mechanism to ensure these don't disrupt foreground put/get
+    Feedback based scheduling
+    Phase lock loop:
+  Feedback is a neat technique to use in system design (PLL analogy)
+
+What types of task might you tune N, R, W for?
+  Multiple concurrent writes
+  Very high readability (N high, R low)
+  "Trending now" results (N, R, W all low)
+    or "have I shown this ad to a user before?"
+
+What are scaling bottlenecks?
+  1-hop routing will require more and more state as # nodes S grows (Q ~ S)
+  That also increases size of gossiping protocol messages
+  Constant reliability demands replication factor N ~ log(S)
+
+Would design be different if they had used C++ instead of Java?
+  W/o garbage collection, maybe could have best node coordinate all updates
+  GC cycles might force sloppier consistency than necessary

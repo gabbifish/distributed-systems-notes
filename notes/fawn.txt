@@ -1,0 +1,226 @@
+FAWN
+====
+
+TAGS: Consistent hashing, front-end/back-end nodes, flash
+
+QUESTION: What happens if a network failure prevents two neighboring back-end
+servers from talking to each other even though both can still talk to all
+front-end servers?
+
+ANSWER: FAWN actually doesn't handle the failure case when a network failure
+prevents two back-end servers from talking to each other, even if both can talk
+to their respective front-end servers. As stated in section 3.4.4, "our current
+design does not cope with a communication failure that prevents one node in a
+chain from communicating with the next while leaving each able to communicate
+with the front-ends. We plan to augment the heartbeat exchange to allow nodes
+to report their neighbor connectivity.". Given that there is no explicit
+failover case for this type of network failure, the two back-end servers that
+can no longer communicate in the case that one of the back-end servers leaves
+and its contents must be "moved to"/replicated in its neighboring node.
+Therefore data could be potentially lost.
+
+What is the goal of this paper?
+  Key-value store with lowest total cost of ownership (TCO)
+  Some key observations:
+    50% of a system's 3-year TCO can be power + cooling!
+    I/O is the bottleneck for many key-value stores
+    Fast CPUs are expensive, disproportionately consume power
+      More cycles/sec, but also more voltage required for higher clocks
+      Speculative execution, branch prediction, out of order/superscaler
+      Big caches consume power
+      Low power states not nearly low enough, so idle CPUs bad
+        Plus motherboards, power supplies still drawing power
+        20% computing capacity draws 50% of power still (p. 2, sec. 2)
+    2GB DRAM consumes as much power as 1TB disk
+      DRAM = dynamic random access memory
+    Flash is low power and fast for random reads
+
+What is flash (NAND flash for SSDs)?
+  Store bits by charging up "floating gates" on MOSFET transistors
+    Solid state makes random reads way faster than spinning disk!
+  Can read and write individual pages (e.g., 2-4KB)
+  But only get a finite number of write cycles (e.g., 1,000-100,000)
+    Flash translation layer (FTL) in SSDs provides *wear leveling*
+    So writing same logical block over and over won't wear it out
+  Must erase entire block (32-64 pages) before writing pages (slow)!
+    Erases more than one page to write a page!! GROSS
+    So FTL keeps reserve of pre-erased blocks, uses log structure
+    Write amplification: must erase/write whole block for small write
+    Makes random writes disastrous
+
+What is proposed hardware configuration & power consumption?
+  Wimpy back-end nodes store actual key value pairs
+    PCEngine Alix 3c2: 500MHz CPU, 256MB RAM, 4GB flash, 100Mbps Ethernet
+    Comsumes 3W idle, 6W busy
+  One modest (but less wimpy) front end machine per ~80 back-ends
+    Less detail, but some intel Atom with 1Gbps Ethernet, consumes 27W
+  Ethernet switches (10W for each 16-port switch in paper's testbed)
+
+How is data assigned to nodes?
+  Back-end servers use consistent hashing, tunable replication factor R
+  Back-end has V virtual nodes each running a FAWN-DS data store
+    Each FAWN-DS has a separate log file for that virtual node
+    Also has an in-memory hash table indexing log file
+      6 bytes per bucket entry:  4-byte offset, 15-bit keyfrag, 1-bit valid
+      matches found through keyfrags and only returned if valid.
+    Periodically also write checkpoint of hash table to log
+  Front-end servers divide keyspace into equal-size wedges
+    Single management node assigns wedges to front-end nodes
+    Nodes forward out-of-range requests to appropriate other front-end node
+    Apply caching at front end
+    On join, back-end nodes responsible for notifying appropriate front-ends
+
+Front-end and back-end servers are kept in sync b/c back-end nodes must contact
+front-end nodes.
+
+p. 4 (first par): "With the 15-bit key fragment, only 1 in 32,768
+    retrievals from the flash will be incorrect and require fetching
+    an additional record."  Is this correct?
+  No: That's probability of two random keys in same bucket colliding
+  Obviously number of false fetches depends on hash table load
+  Reduces collisions by factor of 2^{15} over not having fragments in index
+
+What's going on in Figure 3?
+  Confusing, because text says "hash chaining", but pseudo-code doesn't show
+  Each entry 6 bytes, so makes sense wouldn't also want a 4-byte pointer
+  Looks like they use NUM_HASHES separate tables to find elements
+    Why not just use open-addressed hashing?  (don't know)
+    Open-addressed hashing: performs collision resolution in hash tables.
+  Alternative interpretation:  maybe they really do use chaining
+    Comment mentions chaining in code, but seems to mean next loop iteration
+    If chaining, maybe have multiple hash tables during maintenance?
+
+How does a read from FAWN-DS work?
+  Compute hash for lookup, perform verification process before retrieving entry
+
+How does a write work?
+  Must log a record to appropriate log file on disk
+  Then update/insert pointer in the in-memory hash table
+
+How does a delete work?  Like a 0-byte write except record key as invalid
+  Log delete record and update hash table
+
+What are semi-random writes, why is it good that FAWN-KV has them?
+  Each of V virtual nodes appending to its own file
+  Many flash devices seem to be good at this (fig. 9, p. 9)
+
+What is chain replication?
+  Say you want to replicate linearizable state and have Zookeeper
+  Use zookeeper to organize replicas into a chain
+    Send all writes to head of chain and reads to tail of chain
+    Both read & write replies come from tail of chain:
+                                  read--\
+         write -> [head] -> [node] -> [tail] -> reply
+    All updates ordered by head; read results already replicated everywhere
+  How do you remove a node?
+    Remove the head?  Just make second node the head
+    Remove the tail?  Okay, doesn't have any info other nodes don't have
+    Remove X in A -> X -> B?
+      Now must ensure B has all info A pushed to X
+      So downstream nodes ack writes, starting with the tail
+      Upstream nodes just track unacknowledged writes so can resend
+        Everything ordered by head, so can have sequence numbers
+  How do you add a node?
+    Must copy state from predecessor.
+    E.g., pre-copy snapshot, predecessor logs and sends writes during pre-copy
+
+How does chain replication work with FAWN-KV (key-value)?
+  Chain along consistent hashing circle; any node change is R joins+leaves
+    R = # of replicas
+  Leverage the fact that FAWN-DS (logstructured
+  per-node datastore) is log-structured for joins/leaves (3.4.4)
+  Leaves: Keep a log pointer to last write unacknowledged by downstream nodes
+    Know exactly what you might need to retransmit after failure
+  Joins:  Walk through Figure 8 (p. 7) (insert C1 in B1->C1->D1->E1)
+    Phase 1: Pre-copy from current tail of the chain (100s of seconds)
+    Phase 2: Head sends "chain membership message"
+      Causes nodes to update membership
+      So B1 starts sending new writes to C1
+        But C1 keeps them in a special temporary log
+      Finally, E1 get membership message, flushes it + all prior writes to C1
+        C1 now knows it has all writes until chain membership message
+      Now C1 applies temporary log (from B1) to real data store
+  What if joining as head or tail?
+    Must notify appropriate front-end node
+    What if joining as tail (bottom of page 7)?
+        "node joins before current tail and replies to put requests
+         ...tail predecessor serves as interim tail for gets"
+         ...joined node (before prev tail) handles puts until it is consistent.
+            then it can respond to gets.
+            ^ joined node gets all puts forwarded from head. the old tail
+            never recieves these puts
+      Linearizability guaranteed? Not as described--must be some other trick
+
+Chains are arcs along circle used in consistent hashing (figures 5 and 6)
+
+How do split/merge/compact work? (sec. 3.3.3, p. 5)
+  Scan existing log(s) to create new log(s)
+    How do you know what to write to new log?
+      Check hash table to see if current log entry is live
+  Then briefly lock the data store (20-30ms) to switch to new log(s)
+    Presumably also write checkpoints to new log?
+
+Any corner cases to worry about?
+  Node fails during split/merge?  Ok, because local operation
+  Node fails during join?  Chain membership message gets stuck?
+    Chain membership message should be no different from other writes
+    Node is just no longer valid.
+  Front-end machine fails during back-end join/leave?
+    New front end can query back-end machines for authoritative information
+  Non-transitive communication outages?
+    System gets stuck (homework), but can recover
+  Network bisected?  Maybe node manager preserves consistency?
+
+Does FAWN do something useful with adequate performance/cost?
+ Scalable key-value stores are clearly useful if performance adequate
+
+Does FAWN save power and TCO over the current approach?
+  330 queries/Joule at peak rate (p. 10)
+  Conventional at most 52 queries/Joule (sec. 5.1, p. 10)
+  FAWN hardware both cheaper and smaller datacenter footprint
+
+Could alternate approaches to FAWN do better?  (Fig. 16)
+  Why the Traditional slice in Figure 16?
+  Assumes FAWN nodes have at most 2GB DRAM, vs. much more for conventional
+
+What explains drop from 125MB to 250MB in Table 2?
+  256MB RAM can fit most of 250MB DS, making reads not go to flash
+
+Figure 10:  Why are writes faster than reads?
+  Log structure makes writes fast on flash
+
+Figure 11:  Why is this only 70% of the raw random reads reported in Table 2?
+  Marshaling overhead
+  But also load balance is not perfect
+
+Could wimpy node w. 100Mbps Ethernet become hot spot?
+  Should be alleviated by front-end caching
+  Keys are hashed, so hot keys uniformly distributed around ring
+
+Does Dynamo make you question consistent choice of hashing?
+  What benefits did Dynamo get by ditching, and do we care?
+  1. Easier reconciliation/avoid re-scanning when nodes join+leave system
+     Maybe don't care since we have to re-scan for compaction
+  2. Better load balancing
+     Maybe Figure 15 would look better
+  3. Dynamo dealt with lots of tail latency--FAWN speeds tail reads up.
+
+Figure 12: Why are writes more efficient than reads?  (footnote 4)
+  Flash erase+write much *more* expensive than read
+  But FAWN-KV's log structured storage requires less work per write
+
+Will this scale?
+  Data partitioning seems scalable
+  What about network bandwidth?  Will switches consume more power?
+    What is "full bisection bandwidth" (sec 4.2, p. 10), fat tree (p. 11)?
+
+Fig 13:  Does this tell us anything interesting?
+  Only 3 nodes affected, but measuring whole system throughput
+  Tail latency or specific node performance would be more interesting
+
+What experiments would you need to consider replacing Dynamo with FAWN?
+   Normal case (non-split/join) 99.9%ile latency competitive with Dynamo
+     Doesn't even sacrifice consistence or require buffered writes
+     But would it scale sufficiently?
+  Chain replication maybe not great for tail latency
+  Replication across data centers / regions?

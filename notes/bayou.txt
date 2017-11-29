@@ -1,0 +1,332 @@
+Bayou
+=====
+
+TAGS: Version vectors, causality via time, lamport "happens before",
+CSN / commit sequence number.
+
+QUESTION: Why does Bayou employ a separate dependency check and merge
+procedure, instead of simply rolling the dependency check into the merge
+procedure and always executing the merge procedure?
+
+ANSWER: Merges occur when a dependency check reveals that an
+application-supplied query does not return its expected result. In the case
+that an application-supplied query DOES return its expected result, then no
+merge should be performed (this would be a waste of computing resources, and
+this extra use case would mandate a new merge procedure interpreter to execute
+each write--an expensive task). Keeping dependency checks separate from the
+merge procedure, then, ensures that unnecessary calls to the merge procedure
+can be avoided (and save computing resources in the process).
+
+Say you want to schedule a meeting to discuss CS244b project
+    1. You look at my calendar see I'm free Friday at 2pm
+    2. You check with your project teammates, they are free at 2pm
+    3. You reserve 2pm in your teammates' calendars
+    4. Then you reserve it in my calendar
+    But what if somebody else is simultaneously trying to book me at 2pm?
+  Possible approaches
+    - Execute all operations at central server (google calendar/docs)
+    - Replicate central server using techniques from Paxos/VR/Harp/Raft/etc.
+    - Lock everyone's calendars wherever they are, then use two-phase commit
+    - Allow inconsistency, have a plan to clean up the mess (today's lecture)
+
+How to replicate state when availability more important than consistency?
+    Today's lecture: Disconnected operation makes Paxos impossible
+      So often will need to operate without consistency
+    Monday: Price inconsistency exceeds price of unavailability
+      Still want consistency, just want uptime even more
+  Paxos/VR/Raft is not the answer
+    Can work on at most one side of a network partition
+    Will never work in disconnected mode (e.g., on a airplane)
+  Something like Git may be the answer (works well offline)
+    But not clear how to build apps on top of git
+      Merge conflicts generally requires manual intervention
+      Can't preserve application-level invariants
+        E.g., guarantee account has a non-negative balance
+        History is not linear, so someone can always merge older branches
+        Also, maybe don't want to keep complete history to beginning of time
+
+Idea #1: where replicas agree, there's no problem
+  Break state up into a bunch of individual values
+    E.g., files in a file system, or rows in a database table
+  If two replicas agree on a file or row contents, synchronization trivial
+  Where two replicas disagree, there are two possibilities
+    1. One replicas reflects an edit to the version in the other replica
+       In that case, just take the newer file/row
+    2. Both replicas reflect independent edits
+       Don't want to throw away work, must somehow merge in app-specific way
+         E.g., git dumps conflict text into file
+
+How to detect conflicts if you don't keep complete history?  Version vectors
+  Each replica keeps a version counter
+    Can update on every write, or potentially just on synchronization events
+  Each file/row has version vector reflecting all past writers
+    E.g., <R1=v1, R2=v2, R3=v3, ...>
+  Version vectors have an irreflexive partially order
+    VV1 <= VV1 iff for all R=v in VV1, V2 has R=v' with v <= v'
+    E.g., <R1=10, R2=5> <= <R1=10, R2=7> <= <R1=10, R2=7, R3=1>
+  Reconciling replicas R1 and R2, file has VV1 on R1 and VV2 on R2
+    If VV1 <= VV2, take contents of file on R2
+    If VV2 <= VV1, take contents of file on R1
+    Otherwise (not ordered), you have a conflict
+      e.g. N1: <A=1, B=2, C=3> => <A=2, B=2, C=3> vs N2: <A=1, B=3, C=3>
+      ^ Now N1 takes an action on A without knowing N2 has acted on B!
+
+Problem: version vectors good for conflict detection, not resolution
+  E.g., Say two operations each subtract $1 from account with $10
+  Resolution should probably lead to account having $8
+  But no way to know this given two versions with $9 and a conflict flag
+    Can't differentiate case where previously had $5 both sides added $4
+  BTW, Does git have this problem?  sort of
+    Git has complete history, so can calculate "merge base"
+    But, derives patches that might not be cleanly applicable
+      Can view it as inapplicable operations or bad outcomes that need fixing
+
+Idea #2: treat system state as result of a set of write operations
+  Craft operations such that they can always be cleanly applied
+  Synchronize operations across pairs of nodes whenever they have connectivity
+  Eventually all nodes will learn of every operation
+  Is this good enough?  Problems:
+    In what order to apply operations?
+    Don't want set to grow without bounds--how can we prune it?
+
+Strawman1: hash operations and order by hash value
+  + Deterministic
+  - No way to prune history
+  - No relation to temporal order, can get very confusing results
+      E.g., Replies to comments seem to be posted earlier than comments
+      Or very old operation you thought succeeded suddenly fails
+
+Strawman2: assign timestamp to each operation using real-time clock
+      Break ties arbitrarily (e.g., by writer's node ID or hash of operation)
+  + Deterministic
+  + Mostly temporal order should limit non-intuitive effects
+  - Clocks aren't perfectly synchronized
+      So could still see replies posted before original comments
+
+In ideal world want single copy serializability
+  Everybody must see the same order of operations
+    If I see update 27, then create update 28
+      Then everybody sees my update (28) after update 27
+      Or at least knows 28 follows 27 and delays applying if get 28 first
+    That is, we've preserved causality
+    Example: 27 creates a meeting, my update adds a participant
+  VR/Raft/PBFT/Harp provide similar semantics in a distributed system
+    "Primary" server determines order by log position
+      E.g., 27 and 28 could be positions in the log
+    But that's not scalable, and requires good network connectivity
+Can we preserve causal order in a decentralized way?
+
+What is causality?
+  We want a notion of X "happens before" Y.
+    - Presume X happens before Y, and we have 3 processes P1, P2, P3.
+
+         P1             P2            P3
+         +              +             +
+         |              |             |
+         |              +<------------+ O1
+         |              |             |
+         +------------->+             |
+         |              |             |
+         |              |             |
+      O2 +<-------------+             |
+         |              |             |
+         |              |             |
+         +<---------------------------+ O3
+         |              |             |
+         |              |             |
+         |              |             |
+         +              +             +
+
+    - We see that O1 happens before O2 (ops may be dependent on each other)
+    - No way to know O3 happens after O2!
+    - Now, use clocking mechanism on diagram. C represents clock time at
+      execution of event.
+
+         P1             P2            P3
+         +              +             +
+         |              |             |
+         |              +<------------+ O1 @ C3
+         |              | C2          |           where C2 = max(C3, C2+1)
+         |              |             |
+         +------------->+             |
+         |              |             |
+         |              |             |
+      O2 +<-------------+             |
+         |              |             |
+         |              |             |
+         +<---------------------------+ O3
+         |              |             |
+         |              |             |
+         |              |             |
+         +              +             +
+
+    - Computation of C2 ensures that it is larger or equal to C3; helps
+      preserve event order!
+
+  Powerful enough to help us write distributed applications.
+  Weak enough to be efficiently implemented.
+    I.e. no global clock or central time-stamp server.
+  What does "happening before" mean in a distributed system?
+    In life use realtime clocks, but not precise enough for distributed systems
+
+The "happens-before" relationship in a distributed system [Lamport]:
+  * Model: Processes are a sequence of events, where events are an
+      abstract notion, which could be a single instruction, a procedure,
+      sending a message, receiving an interrupt, etc.
+  * Happens before within a process: an event A that precedes event B
+      in the sequence is said to happen before B.
+  * Lets assume two events: send and receiving messages.
+    A happens before B iff
+      (1) A and B are events in the same process and A comes before B, or
+      (2) A is the sending of a message by one process and B is the
+          receipt of the same message by another process.
+  * Notation: A happens before B is written as A -> B.
+  * Two events *concurrent* if neither happened before the other
+  * Happens-before defines an irreflexive partial ordering
+    Want everyone to apply updates in order that preserves happens before
+
+Logical clocks (a.k.a. Lamport Clocks)
+  Calculate single timestamp integer for each operation
+    Such that applying in order always preserves causality
+  Define using happens-before relationship
+    - Let Ci be logical clock for process Pi as follows:
+        Ci(A) = timestamp for event A
+	The number can be a counter or a monotonically increasing clock
+    - Global Clock C for the system must adhere to:
+          if A -> B, then C(A) < C(B)
+      This condition is satisfied if:
+      (1) if A and B are events in Pi, then Ci(A) < Ci(B)
+      (2) if A is the sending of a message by process Pi and B is the
+          receipt of that message by process Pj, then Ci(A) < Cj(B).
+    - Implementation rules:
+       (1) Pi increments Ci between any two successive events
+           Can increment ++Ci, or can take Ci = max(real-time-clock, Ci+1)
+       (2)(a) If event A is the sending of a message M by process Pi, the
+              the message contains a timestamp Tm = Ci(A).
+          (b) Upon receiving M, process Pj sets Cj >= max(Cj, Ci(A)+1)
+              or max(Cj, Ci(A)+1, real-time-clock)
+    - Want total order?  break ties arbitrarily
+      E.g., by numeric node ID of node that executed event
+
+Coming back to CS244b project meetings, what would operations be in Bayou?
+  "Add 2pm meeting with dm & other participants"?
+    But now no way to resolve conflicts
+  Instead, "Add 15-minute meeting at 2pm, otherwise 2:15pm, etc."
+    Along with a unique ID: <logical-clock, originating-node>
+    This is really instructions for doing a write, not the written data.
+    So the write log contains instructions in the distributed calendar program.
+      We want all nodes to run same instructions in same order. Eventually.
+  Each server applies updates to get state in logical clock total order
+
+How do writes actually propagate?
+  Unidirectional, peer-to-peer synchronization
+  By what mechanism?  Any way you want
+    Punch cards, RS232 serial connections, acoustically coupled modem,
+      floppy disk, IR link, whatever retro technology you like
+    Just beware of hackers on the library WiFi :)
+
+Example:
+  <701,A>: Node A asks for meeting M1 to occur at 2pm, otherwise 2:15pm.
+  <770,B>: Node B asks for meeting M2 to occur at 2pm, otherwise 1:45pm.
+  Let's agree to sort by write ID (e.g. <701,A>).
+  As "writes" spread, nodes may initially apply updates in different order.
+  Each newly seen write is merged into the log,
+    May have to undo updates to insert older ones (e.g., B gets <701,A>)
+    Then replay the log
+    May cause user's view of calendar to change!
+    I.e. all entries are really "tentative", nothing is stable.
+  But when everybody has seen all the writes, everybody will agree.
+
+So far, never know if there's some write from the past you haven't seen.
+  So all entries must be tentative forever, must keep log forever
+  How can we allow a notion of committing a tentative entry?
+  When can you ever truncate the log?
+  For an entry X to be committed, everyone must agree on:
+    The total order of all previous committed entries
+    The fact that X is the next in the total order
+    The fact that all uncommitted entries are "after" X
+
+How does Bayou agree on total order of committed writes?
+  One designated *primary replica*
+  Primary marks each received write with commit sequence number (CSN)
+  So a complete time stamp is <CSN, logical-clock, node-id>
+  CSNs define a total order for committed writes
+    All nodes will eventually agree on it
+    Uncommitted writes come after all committed writes, have CSN = infinity
+      (CSN = infty until all nodes are committed)
+  CSN notifications propagate with updates using the anti-entropy algorithm
+    Important: anti-entropy must always transmit in order
+    So never learn CSN+1 before learning CSN
+  Now slow/disconnected node cannot prevent commits
+
+Does Bayou preserve causality?
+  Yes, because CSNs assigned in way that preserves it
+  Relies on anti-entropy algorithm transmitting requests in order
+    If A -> B and primary learns B, will always have learned A
+    So then if CSNs also reflect logical-clocks, preserves causality
+
+So if tentative writes can switch around what guarantees to we have?
+  Read your writes - In same session, reads always reflect writes
+    Change your password, don't want to get "invalid password error"
+    Don't want deleted emails to reappear
+  Monotonic reads - if R1->R2 in session, R2 reflects all writes seen by R1
+    Don't want meetings to come and go in calendar
+    Mailbox - if you see a new message, request to read it should succeed
+  Writes follow reads - Say R1 sees W (from other session) and makes W1
+		        Everyone must see W1 as happening after W
+    Bulletin board - want replies to appear after messages
+  Monotonic writes - If you write W1 then W2, then everyone sees W2 after W1
+    In text editor, if you save, edit, save, want to see second save second!
+
+When can you discard log entries?
+  Can never discard uncommitted
+    You might need to undo that far when learning of other updates
+  Can truncate any prefix of committed operations
+  How do I avoid re-applying deleted log entry?
+    Each server maintains "omitted" vector O
+      logical clock of most recent update from each server omitted from the log
+    Each server keeps OSN, the sequence number of latest omitted request
+    Ignore operations ordered before O vector
+
+How do I propagate if I've discarded part of my log?
+  Suppose I've discarded *all* writes with CSNs.
+  I keep a copy of the stable DB reflecting just discarded entries.
+  First, I know I cannot receive writes that conflict.
+    Could only happen if write has a CSN < one discarded.
+    But I already saw it, in the right order, so can ignore.
+  When I propagate to node X:
+    If node X's highest CSN is less than my lowest (= Omitted Seq No, OSN),
+      I can send it my stable DB reflecting just committed writes
+      Node X can use my DB as starting point
+      And X can discard all CSN log entries
+      Then play its tentative writes into that DB
+    If node X's highest CSN is greater than mine X can ignore my DB
+
+Can we guess what how they implement anti-entropy efficiently?
+  For committed ops, just ask recipient highest CSN it has seen
+    Easy to send missing CSNs
+  How to determine what tentative ops are missing from recipient?
+    This is a good job for a version vector (good technique to know)
+    Each node tracks highest logical-clock it has heard form each replica
+    Ask recipient for vector, send only higher clocks for each writer
+
+Other interesting trick: creating/deleting servers
+  Generate ID of new server from timestamp on replica generating create op
+  Also propagate "retirement write" letting people remove server from v vecs
+    Note: this is hard in systems that use version vectors without CSNs
+
+How to implement efficiently?  Store two (tentative, committed) databases?
+  No, store two bits per row, tentative and committed
+    Why would a row ever be committed but not tentative?  After delete
+  Keep operation log, to transfer to other nodes
+  Also need undo log, in case tentative operations get reordered
+  And stable checkpoint on disk (for crash recovery)
+
+How is evaluation?
+  Only talk about toy applications
+  Not really any baseline numbers by which to evaluate performance
+  But they measured something, so had a working system
+    Good indication they had to work out a lot of bugs in the ideas
+  This general approach to eventual consistency is hugely useful however:
+    1. Detect conflicts
+    2. Merge

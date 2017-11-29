@@ -1,0 +1,3 @@
+[submodule "distributed-dns/zatt"]
+	path = distributed-dns/zatt
+	url = https://github.com/simonacca/zatt.git

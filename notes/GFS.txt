@@ -1,0 +1,225 @@
+GFS
+===
+
+TAGS: Filesystems (/misnomer!), chunks, b-trees, unique identifiers
+
+QUESTION:
+Can GFS prevent applications from getting confused over duplicate record
+appends? If so, how, and if not, what are applications supposed to do?
+
+ANSWER:
+GFS introduces unique identifiers in records for naming application entities
+(e.g. web documents). Therefore, to filter out duplicate records, GFS can
+identify which records have the same checksums (and therefore, the same
+content). Then GFS can filter out all duplicates that have different unique
+identifiers than the first instance of the duplicated content.
+
+What problem does this paper address?
+  Need to store/access massive data sets efficiently
+  Want to use really cheap (i.e., unreliable) hardware
+  Spread data over many unreliable machines => failure is the norm
+What kind of data was gfs used for?
+  Map/reduce input output (not intermediary files)
+  Copy of web, web index, etc.
+  Producer/consumer queues
+
+What is architecture?
+  One master server (with replicated state)
+  Many chunk servers (hundreds, maybe thousands)
+    Broken into different racks; less bandwidth between racks
+    Store 64MB chunks of files, identified by globally unique ID
+    Chunk servers have 100Mbs ethernet speed between them
+    Chunks are 64MB so there are fewer chunks to deal with; if they had smaller
+      (and more chunks) there would be more overhead in Master about everywhere
+      chunks are.
+    Don't want chunks too big because too many clients will want access at once
+  TOR (Top of Rack) switch between racks is 1Gbs ethernet speed
+  Potentially many clients accessing same or different files on cluster
+
+What is client interface to GFS?  Is it a file system?
+  Not really a FS--just a library applications can use to access storage
+  Sounds like interface is mostly:
+    Read, Write - as usual
+    Append - appends *at least* once, w. gaps and/or inconsistencies
+      Can be duplicated
+      Returns offset where object is stored at.
+      There can be garbage between entries (append beyond EOF!)
+        This is because padding may exist between entries (if current chunk has
+        only 100kB left, and you want to append 200kB file, just write to next
+        chunk). Avoids expensive 2PC process needed to split files between
+        chunks
+  Also, presumably:  Open, Close, Delete, Snapshot,
+      some readdir equivalent (that calls FindMatchingFiles from Table 6)
+
+What are the possible consistency guarantees for a byte range? (Table 1, p. 4)
+    Defined - state equivalent to serial application of client operations
+    Consistent but undefined - will read same data from all replicas of chunk
+    Inconsistent - different chunk replicas have different data
+  How to deal with weird semantics?  (sec 2.7.2)
+    Record layout: | BOR | len | chksum | data |
+    Applications should append records with checksums
+    Use checksums to detect gaps or garbage
+    Use unique record IDs to filter out duplicate records, if necessary
+      => in BOR?
+
+What does the master actually store?
+  File names stored in prefix-compressed form (details are vague)
+  Ownership, permission, etc.
+  Mappings:
+    File -> Metadata (*), Chunks (*), Locks
+      Metadata = owner, permissions, etc
+    Chunk -> Version #s (*), Reference count (*), Replicas, Leases
+    (*) = stored stably in an operational log
+  Storage: under 64 bytes per file, 64 bytes per 64MB chunk (2.6.1)
+  Chunk replicas not stored persistently--why not?
+    Chunk server is ultimate authority over what it is storing
+    Master restarts?  Just ask chunk servers what they store
+  How is master fault tolerant?
+    Replicate state to backups
+    Shadow masters can act as read-only masters while real master unavailable
+
+What do chunk servers store?
+  Chunks (one Linux file per chunk)
+  Chunk Metadata:  Version number, checksum
+  Leases (id of backups)
+  If primary and has lease, keeps track of serial number for serializability
+
+What happens when client reads a file (2.4)?
+  Ask server for (file, chunk index)
+    Server returns:  chunk ID, version, locations of replicas
+    Server may return info for subsequent chunks; client can cache
+  Read chunk from nearest chunk server
+    Determine nearest from IP address because of Google's network topology
+
+What happens when client writes a file? (3.1)
+  One of the chunk servers is the *primary* for the chunk
+    This is determined by having a lease from the master server
+    Master increments version number every time it grants a lease
+    Leases are renewed through periodic heartbeats
+  1. Client asks master who the primary, secondary replicas are
+     If no primary, master grants lease to one before returning
+  2. Master replies, and client caches reply
+  3. Client pushes data to the primary and backup servers
+     Uses chain configuration (Figure 3)
+     But at this point data in LRU buffer cache, not in a file
+     Why?  To make best use of topology and max out upstream bandwidth
+     What is latency?  (3.2)
+       System uses cut-through routing (forward before receiving all data)
+       B-byte write, R replicas, T throughput, L latency:  B/T + R*L
+       R(B/T) + R*L to propagate write to every replica.
+     Could you lower latency?
+       - Maybe stripe chunks across replicas and have them reconcile?
+          Striping: instead of sending to secondary first, send to replicas
+          and have them send to all other replicas. Client to everyone,
+          everyone to everyone (2 rounds, not R)
+         In ideal world would get:  B/T + 2L (client -> all -> all)
+         But in reality could cross top-of-rack switch more, reduce B
+        - Broadcast is an optimization if there is physical broadcast
+  4. Client asks primary to write already pushed data
+     Primary assigns consecutive serial number, applies locally
+  5. Primary broadcasts op and serial number to secondaries
+  6. Secondaries ack to primary when write done
+  7. Primary replied to client.  Possible replies?
+       Success everywhere, or
+       Error(s) at one or more backups (and success at primary)
+         Means byte range is inconsistent
+     What might cause errors?
+       One or more backups unreachable (network outage or failure)
+       Data expired from LRU buffer cache before written to file
+     What does client do on error?  Repeat 3-7 a few times, then goto 1
+  How does record get appended multiple times?  when client repeats
+
+How does gfs master store and manage the namespace? (4.1)
+  Big table mapping: full-pathname -> metadata, read-write lock
+    No data structure actually corresponds to directories
+    But prefix compression avoids storage overhead
+      (Don't need N copies of string "/d1/d2/d3/" for N files in that dir)
+  What locks required to access /d1/d2/d3/leaf?
+    Need read-lock on d{1,2,3}, read- or write- on leaf depending on operation
+    (read-locks on directories up to root, read- or write- on leaf)
+  No write lock for file creation!
+    To create /home/user/foo just read-lock /home and /home/user
+      Prevents inconsistencies in reading home and home/user
+  What about rename /home/user to /save/user?
+    Read-lock /home, /save, but write-lock /home/user, /save/user
+    Write locks will prevent concurrent create of /home/user/foo
+    But note (sec 3.1) master revokes primary leases for renamed files
+
+How do snapshots work?  (3.4, 4.1)
+  Bump reference counts, use copy-on-write
+    Must revoke any lease from primary of chunk that is made copy-on-write
+  What happens when writing copy-on-write chunk?
+    Client asks to write chunk C, master notices refcount > 1
+    Master asks same chunk servers to copy C into C' with new chunk ID
+      C and C' on same servers, so no network bandwidth required
+  What happens when you snapshot a directory?
+    Take write lock on directory (prevents new files created underneath)
+    Recursively snapshot underlying directories and files
+
+What happens when client deletes a file?
+  Renames to temporary name, garbage collected later
+
+What happens when chunk server fails?
+  Prioritize chunks to replicate:
+    # missing replicas, not deleted, load-balance
+
+What happens when master reboots?
+  Reconstruct state:  Ask chunk servers what chunks they have
+  How is startup fast?  Checkpoint + operation log
+    Checkpoint is B-tree that can be directly mmapped--nothing to parse
+  What if chunk server has lower version number?
+    Consider it stale--that server no longer has a replica
+  What if chunk server has higher version number? 4.5
+    Master updates it's own version number; must have crashed before logging it
+
+Explain shapes in Figure 3 (p. 12)
+  (a) Theoretical limit increases with clients until inter-switch link saturated
+      Why does slope decrease in reads?
+        Increased chance of two clients hitting same server
+  (b) Theoretical limit 1/3 reads, because data replicated 3 times
+      Real system hits full-duplex network stack artifact
+      Slope decreases in writes for same reason as reads
+  (c) Everyone appending to same file--chunk server of last chunk is bottleneck
+      Real system experiences congestion + variances in client throughput
+
+How does master place allocated chunks? (4.2)
+  Try to even out disk utilization
+  Make sure chunks live in at least two racks for availability
+
+What happens when chunk server down and misses update?
+  Master assigns version number when it grants primary lease
+  Primary assigns serial number to each chunk mutation
+  So copy will be missing operation, e.g., version number
+  Just discard stale chunk copy and re-replicate
+
+Why do chunk servers checksum chunks?  2.7.1, 5.2
+  Disk interface problem resulted in corruption.  Good idea anyway.
+  Note incremental checksum technique makes very cheap
+
+How does system recover from missing chunks/chunk servers
+  Master sends periodic heartbeats to chunk servers
+  Heartbeats and replies contain lists of chunk IDs, versions
+  Can detect if chunk server doesn't have a chunk
+  Can also detect is chunk server has chunk it doesn't need
+    This is how garbage collection works
+  Master re-replicates missing chunks
+    Careful not to interfere too much with other workload
+    But prioritizes 2x replication, if only one extant replica of chunk
+
+How does replication compare with Erasure coding?
+
+What are the potential bottlenecks in gfs?
+  Master?  no really - maybe if clients constantly create/delete files
+    Old version required linear scan of namespace, replaced by binary search
+    Don't need asymptotic scalability if master 10^{6} times less data/work!
+  Single file read concurrently by all clients
+    E.g., happened with executable in batch system => use higher replication
+  Weird linux performance artifacts in chunk servers
+    E.g., mmap+page fault, or full duplex network stack artifact
+    Probably mostly fixed in modern linux kernels
+
+Do they convince us GFS is the right general approach for large data?
+  Coevolved with applications, resulting in quirky interface
+  Google has since moved on to colossus, but fewer details known
+  But a good study in how "cutting corners" can be a good thing
+    Overall design reasonably simple and system obviously quite useful

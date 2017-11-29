@@ -1,0 +1,249 @@
+Coral
+=====
+
+TAGS: CDN, DNS, Kademlia, Consistent Hashing/Chord
+
+QUESTION: How does coral ensure that client DNS resolvers eventually only query
+nearby dnssrv instances?
+
+ANSWER:
+CoralCDN exploits the authority section of DNS replies to "lock" a client into
+as nearby a dnsserv instance as possible. dnssrv gives nameservers in the
+authority section a very long TTL, so that a nearby dnsserv has the opportunity
+to prove that it is of a larger level (and closer proximity) than the
+preexisting, inferior dsnsserv a DNS client may have cached.
+
+dnsserv does the above by manipulating the domain for which returnd nameservers
+are servers. Because DNS resolvers query the servers for the most specific
+known domain, dnsserv can return more detailed, higher level domains (e.g.
+L2.L1.L0.nyucd.net) to override an inferior, previously cached domain (e.g.
+L0.nyucd.net)
+
+Welcome to second half of course
+  Now, from replication to partitioning...
+
+Consistent hashing
+  Say you want to cache web pages on a number of machines
+    Hash URL, and chose machine based on hash:  e.g., machine = hash % nservers
+  What happens when you add and remove machines?
+    If URL -> server mapping changes completely, most cache data invalid
+  What happens if a client hasn't yet heard of a new machine
+    Could use entirely wrong hash function
+  Consistent hashing:  Only invalidate data in proportion to reconfiguration
+    Add one new server, should invalidate 1/N of data
+
+How to implement consistent hashing?
+  Give each node a number of randomly chosen IDs (e.g., 160-bit number)
+  compute key = Hash(URL), which is also in same ID space
+  Approach 1:  Map IDs onto circle [Chord]
+    Store URL at node whose ID follows key on circle (successor)
+    Assumes IDs eventually are uniformly distributed
+    [Go over what happens when you add or remove a node]
+      When node is added: Insert server 6 between 1 and 2.
+        Everything between 1 and 2 originally stored on 2.
+        Now everything from 1 to 6 is stored in 6, 6 to 2 stored on 2.
+        At most one complete node N worth of elements moved.
+      When node is removed: Remove server 5 between servers 2 and 4.
+        Everything from 2 to 5 no longer stored in 5, but stored on 4.
+        (Plus everything from 5 to 4!)
+  Approach 2:  Arrange node IDs in a tree of height 160 [Kademlia]
+    Start with most significant bit of URL hash (key)
+    Go down tree choosing left or right branch based on next bit of key
+      If only one branch, just chose that one
+    In other words, find node whose ID minimizes  key XOR ID
+      (want as many key bits to match as possible)
+    [Go over what happens when you add or remove a node]
+      When node is added: add node 1 as leaves from best "match" ID
+      When node is removed: if node one is removed, move load to "twin" node
+        (other child node of same parent)
+
+Problem: neighbor of failed node may bear brunt of load spike
+  How to distribute failed node's load more evenly?
+  Give each node multiple "virtual IDs"
+  Key's close to failed node's multiple virtual IDs will be spread out
+  Note: in heterogeneous environment, more virtual IDs for beefier machines
+
+Another approach: CARP [https://tools.ietf.org/html/draft-vinod-carp-v1-03]:
+  For each server ID id_1, id_2, ..., compute h_i := H(id_i, URL)
+  Sort the h_i, and take the server i with the highest "score" h_i
+  In heterogeneous environments, can also scale h_i by load
+  Advantages of CARP:
+    No longer need multiple virtual IDs (instead of dumping documents to other
+      server, all documents hash to different values for other servers;
+      redistribution is more evenly spread).
+    Servers can decline requests under high load, next nodes spread out
+
+Now, say you want to build a gigantic data cache
+  So big each machine only knows about a small fraction of other machines
+  So big that nodes come and go all the time--nodes owned by many people
+  Napster approach--centralized server coordinates, can be shut down
+  Gnutella approach--ad-hoc configuration, broadcast queries very expensive
+
+Better approach:  Use consistent hashing for *routing* as well
+  Store data as before on "closest" node to key in ID space
+    Chord:  closest node closest clockwise around circle
+    Kademlia:  closest node is closest treating ID XOR as distance
+  Build routing tables to allow ID-space navigation
+    Each node knows about ID-space neighbors
+    Perhaps each node knows a few farther-away nodes
+      To move long distances quickly
+  For n nodes, can do this with log n RPCs and O(log n) state at each node
+  These data structures are called distributed hash tables (DHTs)
+
+How would you do this in Chord circle?
+  Each node must know next node around circle (successor)
+  Each node should cache node almost 1/2 way around circle, 1/4 way, etc.
+    This is called the "finger table"
+  So ask closest node you know about for its routing table
+How would you do this in Kademlia tree?
+  If a node's (base 2) id is b_0 b_1 b_2 ..., the node must know:
+    - A node with first bit ~b_0  (other half of tree)
+    - A node with prefix b_0 ~b_1 (other quarter in this half of tree)
+    - A node with prefix b_0 b_1 ~b_2
+    - etc.
+  Then you can get one bit closer to key with each RPC
+  (Note: To handle unbalanced trees, each node actually must
+   know all nodes under some point in the tree with two children.)
+
+In a very large system, machines will be failing all the time
+  If N machines and a constant fraction fail, then with subsets of
+         size < O(log(N)) stand good chance of all nodes in a group failing
+  Pick "replication factor" k-sized set unlikely to fail simultaneously
+  In Chord, want to avoid "breaking" the circle
+    So each node must know k successors around circle, in case k-1 fail
+    Can always re-build finger tables as long as circle not broken
+  In Kademlia, should know up to k nodes with each prefix
+         ~b_0..., b_0 ~b_1..., b_0 b_1 ~b_2...
+    I.e., k nodes in other half of tree, other quarter of this half, etc.
+  Must do *maintenance* to ensure you learn of dead nodes
+    Note:  Advantage of Kademlia is symmetry
+      You receive RPCs from nodes in same distribution as you send them to
+      So will often already know that nodes in routing table are alive
+    Chord goes clockwise around circle, so incoming RPCs less useful
+
+Optimization
+  Note Kademlia lets you contact *any* node in appropriate subtree
+  So for better performance, cache nodes with low round-trip-time (RTT)
+  Note: failure causes RPC timeouts, which can seriously hurt latency
+    Can trade off bandwidth for latency w. concurrent requests
+    Helps prevent staleness (more bandwidth, but better latency in face of
+      unreliable nodes)
+
+Digression:  Bit shifting vs. bit correcting
+  Using bit *shifting*, can actually have constant-size routing table
+    E.g., node with ID x knows nodes with IDs 2x and 2x+1
+    Look up node whose LSB is equivalent to MSB of the target ID.
+    -> shift bits "in", match next LSB to MSB
+    -> continue matching until arrive at final node.
+    -> KOORDAY @ MIT
+  But makes failure recovery and optimization harder
+
+Note Kadmlia is used by trackerless bit torrent
+  Seems to scale to 1,000,000+ nodes
+
+So what was intended use of CoralCDN?
+  Most web sites have peak usage many times average
+  Pool resources to absorb flash crowds, solving "slashdot problem"
+  Easy to use--just append ".nyud.net" to URLs
+  Ideally avoid contributing to load spike by sharing data among cache servers
+  Can we solve this in a simpler way?
+
+Straw-man:  put web objects into Kademlia
+  compute key = Hash(URL) = key, value = contents of web object
+    Store <key, value> in Kademlia
+  Just shifted problem; nodes in Kademlia now subject to flash crowds
+    We now hammer Kademlia node closest to URL!
+  So at a minimum, should just use Kademlia for metadata, not data
+
+Straw-man2:  Network of web proxies
+  When you have a URL, store <Hash(URL), my address> in Kademlia
+  When you want a URL, look up Hash(URL) in Kademlia, ask proxy
+  If no one has it, then get data from origin web server
+  Problems?
+    1. Could require slow RPCs to find nearby copies
+       E.g., USA node must query Asia node to find USA copy of data
+    2. Could overload Kademlia nodes just with metadata requests
+       Imagine everyone storing the same key to Kademlia
+    3. If many copies, which one(s) should you download from?
+        Ideally the closest node geographically
+    4. How to map clients to nearby proxies?
+       E.g., sending client in Asia to proxy in USA very bad for performance
+       Ugh, requires sending RPCs around the world!
+
+How does coral address #1 (USA nodes query Asia for metadata)?
+  Join multiple DHTs with different latency thresholds (e.g., 20ms, 60ms)
+    Always begin search in low-latency cluster
+    Even if low-latency cluster misses, got you closer to target kademlia ID
+    Level 0 cluster is global, has latency threshold infinity
+  How do nodes join clusters level n clusters for n > 0?
+    Initially create a singleton cluster
+    Learn of other clusters whenever you exchange RPCs with other nodes
+    Every 5 minutes re-reevaluate clusters and switch membership
+  How do clusters stabilize?
+    Hysteresis: Join if 80% of nodes below RTT threshold, leave if only 50%
+    What if more than one good cluster?
+      Join the biggest one, or break tie by lowest cluster ID
+    What constitutes a tie?
+      For the first hour of youngest cluster, size within factor of two
+      Next hour, must be within factor of 8, then repeat.  Why?
+        To perturb really pathological oscillation
+
+So what is coral API (p. 3)?
+  put(key, val, ttl, [levels]) - stores val under key
+  get(key, [levels]) - returns a subset of values associated with keys
+    Both put and get can optionally be restricted to certain cluster levels
+  nodes(level, count, [target], [services])
+    Returns count nodes near some target IP address
+    Services can request nodes running HTTP proxy or DNS server
+  levels() - return how many levels
+
+How does coral address problem #2 (avoid hotspots within Coral index)?
+  Always take full route to target node, correcting one bit at a time
+    E.g., don't skip to node closest to key just because you have it cached
+  On get, stop once you find value
+  On put, stop if intermediary node on path is both *full* and *loaded*
+      Full - node already has four values associated with key
+      Loaded - last request for key was less than 5 seconds ago
+    Backtrack and store on previous non-full node
+  What is point of loaded check?
+    What if TTL expired on closest node - need to store some value there
+    "Leaking" 12 requests/min ensures close nodes stay full
+
+How does Coral address problem #3 (download from closeby nodes)?
+  Searching first in low-latency cluster anyway
+  So likely to hit pointer stored by node in your cluster
+
+How does Coral address #4? (map clients to nearby clusters)?
+  Assume DNS resolvers close to clients (common assumption for CDNs)
+  Use domain names of form:  http.L2.L1.L0.nyucd.net
+    Initially pretend L0.nyucd.net is the only domain
+    Close to resolver?  Synthesize [L2.]L1.L0.nyucd.net domain
+      Return DNS servers from within that cluster
+      Client resolver will cache and stick to that subdomain
+
+Why does Coral index caches that don't have data yet (w. 20 sec TTL)?
+  Goal: Minimize load on origin server even from proxies
+  Want cut-through routing
+
+What would be different if Coral designed to run on < 1000 servers?
+  Don't need DHTs, can do one-hop routing (globally, or in disjoint clusters)
+  "Metadata flash crowds" a non-issue (at most 1000 requests)
+
+What prevents Coral from running on 1,000,000+ servers?
+  Need adopters (but could plausibly get people running software)
+    But people would plausibly want to run the software
+  No way to do content authentication!
+    Frustratingly non-fundamental to underlying ideas
+    Artifact of web just having poor content authentication
+      Which is somewhat of a vulnerability for commercial CDN use, too
+    These days could maybe work around with web crypto APIs?
+    In the end, system was always closed (required crypto key to join)
+  But note various other related projects:
+    FireCoral (do it in the browser with an extension)
+    PeerCDN (leveraged advent of WebRTC many years later)
+
+What are evaluation questions we should ask?  Provided by paper (p.8):
+  1. Does CoralCDN solve the flash crown problem? (Yes)
+  2. Was clustering useful / worth the complexity? (Yes)
+  3. How well did clustering work? (Well)
+  4. Does Coral itself experience hot spots? (Yes)

@@ -1,0 +1,219 @@
+Spanner
+=======
+
+TAGS: B-tree, zones, Paxos, TrueTime
+
+QUESTION: How does Spanner perform a really expensive read-write transaction
+(such as a schema change) without blocking other concurrent read-write
+transactions?
+
+ANSWER:An expensive transaction, such as a schema change, is explicitly
+assigned a timestamp in the future. Because this expensive transaction's start
+timestamp is in the future, it is guaranteed that its commit timestamp will be
+after the commit timestamps of every transaction concurrently occurring before
+the expensive transaction is issued. (4.1.2). This ensures that expensive
+operations across servers can complete with minimal side effects upon other
+concurrent activity.
+
+
+What is motivation?  F1 (ads) is Google's bread and butter
+  Need consistency and features of an RDBMS
+    RDBMS = relational database management system
+  Need massive scalability
+    Tens of terabytes causing serious problems with MySQL
+    Required years of work to re-shard data!
+
+What is spanner API?
+  Looks a bit like SQL (Fig. 4, p. 255)
+    Except one B-tree (index) per table
+    Can interleave data from multiple tables
+  Lost SQL functionality:
+    Break key space up into directories to give locality hint to system
+      Each directory can have its own replication/placement policy
+      No secondary keys or indices
+    Schema changes are super expensive
+  Spanner adds functionality on top of SQL:
+    Supports linearizable read-write transactions (global consistency)
+      Normal SQL data base would need to be sharded (ugh)
+    Also supports linearizable lock-free read-only transactions
+      Must predeclare a read-only transaction
+      Can run at server-chosen recent time, or client specified time/range
+      Because no locks, read-only transactions don't abort
+        (unless old data has been garbage-collected)
+    Only one index per row in DB!
+    Can do snapshot reads in DB
+    Reads will never abort because locks are never held?
+      Sometimes reads fail because of garbage collection, but this is rare
+
+How are the servers organized? (Fig. 1)
+  Servers are grouped into *zones*--the unit of administrative deployment
+    Each zone physically isolated within a datacenter
+  Each zone contains a hundred to thousands of *spanservers*
+  Each spanserver stores 100-1000 *tablets* (<key, timestamp> -> value map)
+    Basically a B-tree with a write-ahead log (for consistency after crash)
+    But may encapsulate multiple directories (partitions of row space) (p. 254)
+  Each tablet is managed by a Paxos state machine
+    Allows tablets to be replicated to spanservers in different zones
+  Zonemaster - assigns data to spanservers
+  Universe master - debugging console
+  Placement driver - decides when to move data on timescale of minutes
+    Meets updated replication constraints or helps load balancing
+
+How to add or remove servers to a Paxos group?
+  Don't.  Just "movedir" directory to a new tablet (sec 2.2, p. 254)
+  Does that block access to the directory?
+    Only briefly--moves data in background, then locks to move what changed
+
+Why does spanner log Paxos writes twice?  (P. 253)
+  Tablet has write-ahead log, but Paxos also requires a log
+  Paper says likely to remove this limitation eventually
+
+Note use of witnesses (parenthetical comment in Sec. 2.2 on p. 254)
+  "North America, replicated 5 ways with 1 witness"
+    Want witnesses because they make reads faster
+  Maybe combining Paxos with Harp-style witnesses
+  Why might you want 1 witness instead of 2 with 5 replicas?
+    Replicas can help scale read workloads, place data closer to clients
+    Maybe witnesses absorb load in getting partitioned nodes back up to date?
+    Beyond that, unclear if spanner witnesses differ from HARP
+
+In straight-up Paxos, both reads and writes go through same protocol
+  Leader must wait another round trip to hear from quorum
+  Why not just handle read locally at the leader (no data to replicate)?
+    Later leader could have externalized writes, violating linearizability
+  How do we fix Paxos to handle reads at leader?
+    Nodes grant leader lease--promise not to ack other leaders for time T
+    Given leases from quorum, leader knows no other leaders, can read locally
+    Assumes bounded clock drift
+
+Let's imagine a simpler straw man #1 to understand spanner's design
+  Assume the asynchronous system model (like VR, Raft, and Paxos)
+  Assume multiple Paxos groups
+  Suppose each transaction stays entirely within a Paxos group
+    Hence, no synchronization between Paxos groups, no fancy time stuff
+    (Assumption will break down with need to fragment tablets)
+  Use two-phase locking for concurrency control
+    Acquire locks during a transaction, release on commit
+    Ensures linearizability of transactions within Paxos group
+  Paxos leader maintains lock table with shared and exclusive locks
+    If leader fails or loses lease, can always abort the transaction
+
+What could go wrong in straw man #1?
+  Within Paxos, everything will be totally ordered, but not externally
+  E.g., A and B concurrently post comments to different Paxos groups
+    C sees A's comment but not B's, D sees B's but not A's
+    This violates *external consistency* -- no guranatee of linearizability
+
+Straw man #2:  Implement cross-Paxos-group transactions with locking
+  Transaction must only commit if locks in all Paxos groups intact
+Use two-phase commit across Paxos groups (like Viewstamped Replication)
+  Just pick one of the Paxos groups to act as 2PC coordinator
+  What about two-phase commit's lack of fault-tolerance?
+    Okay because Paxos groups themselves are fault tolerant
+
+What's wrong with straw man #2?
+  That's a lot of locking, especially with many read-only transactions
+    In above example, reads by C and D must lock A's and B's comments
+    Each of C, D needs a concurrent lock on both A's and B's comments
+  That's a lot of load on the leader (which must handle all reads)
+  It might not make sense to cram everything into one transaction
+    E.g., decision to load A's and B's comments might be made in browser
+      Browser could fail or be slow--shouldn't hold even read locks
+
+How does spanner solve this?  Totally ditches async. model with TrueTime
+What is TrueTime?  API for retrieving estimate of current time
+  Can't globally synchronize exact time, so returns a bounded interval:
+    TT.now() -> TTinterval: [earliest, latest]
+  Requires hardware (GPS, atomic clocks)
+  Uses local daemon to coordinate
+  Assumes bounded clock drift (200us/sec = 0.02%)--is this reasonable?
+    Sec. 5.3 says clocks fail 6 times less often than CPUs, so maybe
+  TT.now() estimate actually takes shape of sawtooth because of clock drift
+  Faster responses (RTT) about time mean that epsilon (uncertainty) is smaller
+    Faster networks, better estimates of time!
+  TrueTime error bound also worsened if a server is heavily loaded
+    => latency in response, RTT larger.
+
+Idea:  Use real time to order all transactions globally
+  Either A's or B's comment will have later timestamp
+  If you see effects of later transaction, guaranteed to see earlier one
+
+How does time eliminate the need for read locking?
+  Assign each transaction a timestamp that preserves linearizability
+    (I.e., if A committed before B started, then s_A < s_B)
+    Within Paxos log, transaction timestamps must increase monotonically
+  Tablets store history of values and allow reading at particular time
+    Just read values at a read-only transaction's time to get linearizability
+  Now reads can be spread across entire Paxos group
+    So long as replica knows history through transaction's timestamp
+    If replica fails?  Try another one with same timestamp
+    That's why read-only transactions can't fail (modulo garbage collection)
+
+For read transaction, no locks needed (4.2.2)!
+  Leader simply reads entry at last timestamp.
+
+How does a read-write transaction proceed?
+  First, a client reads a bunch of data, acquiring read locks as needed
+  When done, all writes buffered at client which holds only read locks
+    Note you don't read your own writes during transaction
+    Okay as reads return timestamp, which uncommitted writes don't have
+  Writes and lock releases must be sent to one or more Paxos groups
+    Then somehow pick timestamp for transaction, atomically commit
+    ^ This way you know where to put writes (after reads) because you have
+      read timestamps.
+
+Let's say whole transaction involves only one group--what happens?
+  Client sends writes to group leader in a *commit request*
+  Leader must pick a timestamp s--how does it proceed?
+    s must be greater than any previously committed transaction in Paxos log
+    Two-phase locking implies a period where all locks simultaneously held
+      Logically want transaction timestamp to lie within this period
+        i.e., want s greater than the time of any lock acquisition (prev txns)
+      So, conservatively, ensure s > TTnow.latest() at commit request receipt
+  *Commit wait*: must wait until s < TTnow.earliest() before replying--why?
+    External consistency
+  Minimum latency: wait for s < TTnow.earliest(). Faster if epsilon is smaller!
+
+What happens when transaction involves multiple groups?
+  Client picks one group to be two-phase commit coordinator
+  Sends commit request to *coordinator leader* (Paxos leader of that group)
+  Coordinator broadcasts vote request to other participant leaders
+  On receipt of the vote request, the participant leaders must:
+    Acquire any write locks that will be necessary for transaction
+    Pick a *prepare timestamp* to send back with VOTE-COMMIT
+      Prepare timestamp must lie within the term of the leader's lease
+      Must also also be greater than any committed transactions
+    Once all participants send VOTE-COMMIT
+      Coordinator picks timestamp s such that:
+        - s >= Max prepare timestamps
+        - s > timestamp for anything that already has been in PAXOS log
+        - s > TTnow.latest() when commit request received
+        - s fulfills requirements of other participants' prepare timestamps
+          (s in coordinator leader's lease term, > max in log)
+      Again "commit wait" until s < TTnow.earliest()
+
+How to implement leases with TrueTime?
+  Need all leases to be disjoint, so rely on TrueTime
+  Could you make do with bounded clock drift assumption (no GPS, etc.)?
+    Problem is, leaders must pick timestamps within their lease interval
+    Leader sends request to other nodes:
+    - remembers time of sent request
+    - gets back promise of lease
+    - time of lease grant must be after time of sent request
+    - leases have to be recorded persistently at replicas
+
+HW QUESTION: Schema changes
+  No explicit locking, because humans ensure only one schema change at a time
+  Hence, can pick timestamp far in the future for "flag point"
+
+Explain Figure 5--what causes shape of leader-hard?
+  Remaining lease times distributed between 0 and 10 seconds
+
+How to implement secondary indexes?
+  Secondary Index: database table like | name | email |
+    You want to be able to look up by both name or email as indexes.
+  Transactions + B-trees are all you need
+    Clients can atomically update table+index
+      Main table: | name | email |
+      Secondary table: | email | name |
+      Now can query over both!
